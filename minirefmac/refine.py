@@ -21,6 +21,7 @@ Murshudov et al. (1997, 2011), Pannu & Read (1996), Pannu et al. (1998).
 import copy
 import json
 import math
+import os
 import time
 from dataclasses import dataclass, asdict
 
@@ -28,6 +29,7 @@ import numpy as np
 from scipy.optimize import minimize
 
 try:
+    from . import __version__
     from . import dataio, sfcalc, likelihood, gradient, geometry, maps, fastkernel
     from . import simdkernel, fftcalc
     from .core import ScaleParams, CycleStats
@@ -35,6 +37,7 @@ except ImportError:  # pragma: no cover - allow flat-module execution
     import dataio, sfcalc, likelihood, gradient, geometry, maps, fastkernel
     from core import ScaleParams, CycleStats
     import simdkernel, fftcalc
+    __version__ = "0.2.0"
 
 
 @dataclass
@@ -62,19 +65,22 @@ class Options:
     b_min: float = 2.0
     b_max: float = 200.0
     chunk: int = 48
-    # Experimental kernel fusion: compute the phase E once per evaluation and
-    # share it between Fc and the atomic gradients (see fastkernel.py).  False
-    # (default) keeps the original two-pass path bit-for-bit unchanged.
+    # Structure-factor / gradient kernel.  "auto" (default) picks the fastest
+    # exact kernel available on this machine: the AVX-512 SIMD kernel when the
+    # CPU supports it and a C compiler (or a prebuilt _simd.so) is present,
+    # otherwise the pure-numpy reference path.  Every kernel is fed the SAME
+    # ML coefficient G, so they all trace the identical refinement trajectory.
+    #   numpy : reference implementation (gradient.py)
+    #   simd  : AVX-512 C kernel, ~8x faster per pass (simdkernel.py/_simd.c)
+    #   fused : numpy kernel fusion of Fc+gradients (fastkernel.py)
+    #   fft   : O(G log G) FFT structure factors (fftcalc.py), approximate
+    kernel: str = "auto"
+    # Deprecated aliases kept for backwards compatibility with old scripts;
+    # they only take effect when kernel == "auto".
     fused_kernel: bool = False
-    # STEP 2: AVX-512 SIMD C kernel (simdkernel.py / _simd.c).  Same fused math
-    # as fastkernel but the inner loop runs in hand-written AVX-512.  Requires
-    # an AVX-512 capable CPU; falls back at import time if unavailable.
     simd_kernel: bool = False
-    # STEP 3: O(G log G) FFT structure factors (fftcalc.py).  Builds the
-    # electron density on a grid, one FFT, sample at HKL.  Fc ~0.1-0.2% of the
-    # direct sum on a ~0.3 A grid; the adjoint-FFT gradient shares the same cost.
     fft_kernel: bool = False
-    fft_spacing: float = None       # None -> auto (memory-aware, ~0.3 A)
+    fft_spacing: float = None       # None -> auto (adaptive, see fftcalc.auto_spacing)
     fft_radius: float = None        # density cut-off radius (A); None -> per-atom adaptive
     # REFMAC5 writes F/SIGF and all map coefficients on the ABSOLUTE scale
     # (F_abs = F_obs / k_total).  "observed" keeps the legacy input scale.
@@ -92,6 +98,7 @@ class Refiner:
     def __init__(self, data, opts=None):
         self.data = data
         self.opts = opts or Options()
+        self.kernel, self.kernel_reason = self._resolve_kernel()
         self.log_lines = []
         self.cycles = []
         self.restr = None
@@ -123,6 +130,109 @@ class Refiner:
             print(msg, flush=True)
 
     # ------------------------------------------------------------------
+    def _resolve_kernel(self):
+        """Decide which structure-factor/gradient kernel to use.
+
+        Returns ``(name, reason)``.  An explicit ``Options.kernel`` wins; the
+        deprecated boolean flags act as explicit choices too; ``"auto"``
+        probes the machine and never raises (a missing compiler or a CPU
+        without AVX-512 simply means the numpy reference path).
+        """
+        o = self.opts
+        k = str(getattr(o, "kernel", "auto") or "auto").strip().lower()
+        valid = ("auto", "numpy", "fused", "simd", "fft")
+        if k not in valid:
+            raise ValueError("Options.kernel must be one of %s (got %r)"
+                             % (", ".join(valid), o.kernel))
+        legacy = [name for name, flag in (("fused", o.fused_kernel),
+                                          ("simd", o.simd_kernel),
+                                          ("fft", o.fft_kernel)) if flag]
+        if k == "auto" and legacy:
+            return legacy[0], "legacy flag --%s-kernel" % legacy[0]
+        if k == "auto":
+            ok, why = simdkernel.probe()
+            return ("simd", why) if ok else ("numpy", why)
+        if k == "simd":
+            ok, why = simdkernel.probe()
+            if not ok:
+                msg = ("SIMD kernel requested but unavailable (%s); "
+                       "falling back to numpy" % why)
+                if os.environ.get("MINIREFMAC_STRICT_KERNEL"):
+                    raise RuntimeError(msg)
+                return "numpy", msg
+            return "simd", why
+        return k, "explicit --kernel %s" % k
+
+    # ------------------------------------------------------------------
+    def _calc_fc_atoms(self, xyz, b_iso, occ):
+        """Atom-only structure factors, computed with the selected kernel."""
+        d, o = self.data, self.opts
+        if self.kernel == "simd":
+            # G = 0 makes the kernel return Fc only; the gradient terms are
+            # computed but discarded.  Still ~8x faster than numpy.
+            zero = np.zeros(d.n_ref, dtype=np.complex128)
+            fc, _, _ = simdkernel.simd_fc_and_gradients(
+                d, xyz, b_iso, occ, zero, np.ones(d.n_ref), chunk=o.chunk)
+            return fc
+        if self.kernel == "fft":
+            sp = (o.fft_spacing if o.fft_spacing is not None else
+                  fftcalc.auto_spacing(d.cell, getattr(d, "d_min", None),
+                                       b_min=float(np.min(b_iso))))
+            grid, atoms, _ = fftcalc._scatter_density(
+                d, sp, sfcalc._sym_ops(d), o.fft_radius,
+                xyz=xyz, b_iso=b_iso, occ=occ)
+            return fftcalc.fft_fc(d, spacing=sp, radius_A=o.fft_radius,
+                                  grid=grid, atoms=atoms)
+        return sfcalc.calc_fc(d, xyz, b_iso, occ)
+
+    # ------------------------------------------------------------------
+    def _kernel_eval(self, xyz, b_iso, occ, fcf):
+        """One X-ray evaluation: Fc -> ML coefficients G -> exact gradients.
+
+        All kernels receive the *current* G, i.e. the gradient returned here is
+        the exact derivative of the ML target at ``(xyz, b_iso)``.  That is
+        what makes every kernel trace the same trajectory (see
+        ``tests/test_kernels.py``-style check 9 in selftest.py).
+        """
+        d, o = self.data, self.opts
+        kernel = self.kernel
+        if kernel == "fft":
+            # O(G log G): scatter the density ONCE, one FFT for Fc, and the
+            # adjoint FFT for the gradients on the same grid.
+            sp = (o.fft_spacing if o.fft_spacing is not None else
+                  fftcalc.auto_spacing(d.cell, getattr(d, "d_min", None),
+                                       b_min=float(np.min(b_iso))))
+            grid, atoms, _ = fftcalc._scatter_density(
+                d, sp, sfcalc._sym_ops(d), o.fft_radius,
+                xyz=xyz, b_iso=b_iso, occ=occ)
+            fc_atoms = fftcalc.fft_fc(d, spacing=sp, radius_A=o.fft_radius,
+                                      grid=grid, atoms=atoms)
+            fc_total = sfcalc.build_fc_total(d, fc_atoms, self.fmask, self.scale)
+            negll, G, mm, phase, extra = likelihood.negll_and_G(
+                d, fc_total, self.scale, self.mlpar,
+                use_phase_prior=o.use_phase_prior, work_only=True)
+            _, gx, gb = fftcalc.fft_gradients(
+                d, xyz, b_iso, occ, G, fcf, spacing=sp,
+                radius_A=o.fft_radius, want_fc=False, grid=grid)
+            return fc_atoms, gx, gb, fc_total, negll, G, mm, phase, extra
+
+        fc_atoms = self._calc_fc_atoms(xyz, b_iso, occ)
+        fc_total = sfcalc.build_fc_total(d, fc_atoms, self.fmask, self.scale)
+        negll, G, mm, phase, extra = likelihood.negll_and_G(
+            d, fc_total, self.scale, self.mlpar,
+            use_phase_prior=o.use_phase_prior, work_only=True)
+        if kernel == "simd":
+            _, gx, gb = simdkernel.simd_fc_and_gradients(
+                d, xyz, b_iso, occ, G, fcf, chunk=o.chunk)
+        elif kernel == "fused":
+            _, gx, gb = fastkernel.fused_fc_and_gradients(
+                d, xyz, b_iso, occ, G, fcf, chunk=o.chunk)
+        else:
+            _, gx, gb = gradient.fc_and_atomic_gradients(
+                d, xyz, b_iso, occ, G, fcf, chunk=o.chunk, want_fc=False)
+        return fc_atoms, gx, gb, fc_total, negll, G, mm, phase, extra
+
+    # ------------------------------------------------------------------
     def _prepare(self):
         o = self.opts
         self.restr = geometry.Restraints(
@@ -147,7 +257,7 @@ class Refiner:
     def _outer_update(self, xyz, b_iso, first=False):
         """Refresh mask, scales and ML parameters with the current model."""
         d, o = self.data, self.opts
-        fc_atoms = sfcalc.calc_fc(d, xyz, b_iso, d.occ)
+        fc_atoms = self._calc_fc_atoms(xyz, b_iso, d.occ)
         try:
             self.fmask = sfcalc.calc_fmask(d, xyz) if o.solvent == "mask" else None
         except Exception as exc:      # pragma: no cover
@@ -181,8 +291,15 @@ class Refiner:
             d, fc_total, self.scale, self.mlpar,
             use_phase_prior=o.use_phase_prior, work_only=True)
         fcf = self.scale.fc_atom_factor(d)
-        _, gx, gb = gradient.fc_and_atomic_gradients(
-            d, xyz, b_iso, d.occ, G, fcf, chunk=o.chunk, want_fc=False)
+        if self.kernel == "simd":
+            _, gx, gb = simdkernel.simd_fc_and_gradients(
+                d, xyz, b_iso, d.occ, G, fcf, chunk=o.chunk)
+        elif self.kernel == "fused":
+            _, gx, gb = fastkernel.fused_fc_and_gradients(
+                d, xyz, b_iso, d.occ, G, fcf, chunk=o.chunk)
+        else:
+            _, gx, gb = gradient.fc_and_atomic_gradients(
+                d, xyz, b_iso, d.occ, G, fcf, chunk=o.chunk, want_fc=False)
         fg, ggx, ggb, stats = self.restr.calc(xyz, b_iso)
         n_x = math.sqrt(float(np.sum(gx ** 2) + np.sum(gb ** 2)))
         n_g = math.sqrt(float(np.sum(ggx ** 2) + np.sum(ggb ** 2)))
@@ -209,72 +326,19 @@ class Refiner:
         bounds = [(-v_limit, v_limit)] * (3 * m)
         bounds += [((o.b_min - b0[j]) / sb, (o.b_max - b0[j]) / sb) for j in range(m)]
 
-        # ---- optional kernel-fusion warm start (see fastkernel.py) --------
-        # The fused kernel needs G *before* it evaluates the shared phase E,
-        # but G depends on the current Fc (chicken-and-egg).  We warm-start G
-        # from the v=0 Fc (self.last_fc_total, produced by _outer_update) and
-        # refresh it after every evaluation; the first L-BFGS evaluation (v=0)
-        # is therefore bit-identical to the original path.  Default path
-        # (fused_kernel=False) does not enter this block at all.
-        g_warm = [None]
-        if o.fused_kernel or o.simd_kernel:
-            base_fc_total = self.last_fc_total
-            if base_fc_total is None:  # pragma: no cover - direct _make_target call
-                base_fc_total = sfcalc.build_fc_total(
-                    d, sfcalc.calc_fc(d, xyz0, b0, occ), fmask, scale)
-            _, G0, _, _, _ = likelihood.negll_and_G(
-                d, base_fc_total, scale, mlpar,
-                use_phase_prior=prior, work_only=True)
-            g_warm[0] = G0
-
         def fun(v):
             self.n_eval += 1
             xyz = xyz0 + v[:3 * m].reshape(m, 3) * sx
             b_iso = b0 + v[3 * m:] * sb
 
-            if o.fused_kernel:
-                fc_atoms, gx, gb = fastkernel.fused_fc_and_gradients(
-                    d, xyz, b_iso, occ, g_warm[0], fcf, chunk=o.chunk)
-                fc_total = sfcalc.build_fc_total(d, fc_atoms, fmask, scale)
-                negll, G, mm, phase, extra = likelihood.negll_and_G(
-                    d, fc_total, scale, mlpar,
-                    use_phase_prior=prior, work_only=True)
-                g_warm[0] = G
-            elif o.simd_kernel:
-                fc_atoms, gx, gb = simdkernel.simd_fc_and_gradients(
-                    d, xyz, b_iso, occ, g_warm[0], fcf, chunk=o.chunk)
-                fc_total = sfcalc.build_fc_total(d, fc_atoms, fmask, scale)
-                negll, G, mm, phase, extra = likelihood.negll_and_G(
-                    d, fc_total, scale, mlpar,
-                    use_phase_prior=prior, work_only=True)
-                g_warm[0] = G
-            elif o.fft_kernel:
-                # O(G log G): grid density -> one FFT -> sample at HKL.
-                # Scatter the density ONCE for the *trial* model and reuse the
-                # grid for the adjoint gradients (a second scatter + FFT would
-                # double the cost).
-                _sp = o.fft_spacing if o.fft_spacing is not None else \
-                    fftcalc.auto_spacing(d.cell, getattr(d, "d_min", None))
-                _sym = sfcalc._sym_ops(d)
-                _grid, _atoms, _orth = fftcalc._scatter_density(
-                    d, _sp, _sym, o.fft_radius, xyz=xyz, b_iso=b_iso, occ=occ)
-                fc_atoms = fftcalc.fft_fc(d, spacing=_sp, radius_A=o.fft_radius,
-                                          grid=_grid, atoms=_atoms)
-                fc_total = sfcalc.build_fc_total(d, fc_atoms, fmask, scale)
-                negll, G, mm, phase, extra = likelihood.negll_and_G(
-                    d, fc_total, scale, mlpar,
-                    use_phase_prior=prior, work_only=True)
-                _, gx, gb = fftcalc.fft_gradients(
-                    d, xyz, b_iso, occ, G, fcf, spacing=_sp,
-                    radius_A=o.fft_radius, want_fc=False, grid=_grid)
-            else:
-                fc_atoms = sfcalc.calc_fc(d, xyz, b_iso, occ)
-                fc_total = sfcalc.build_fc_total(d, fc_atoms, fmask, scale)
-                negll, G, mm, phase, extra = likelihood.negll_and_G(
-                    d, fc_total, scale, mlpar, use_phase_prior=prior, work_only=True)
-
-                _, gx, gb = gradient.fc_and_atomic_gradients(
-                    d, xyz, b_iso, occ, G, fcf, chunk=o.chunk, want_fc=False)
+            # Fc -> ML coefficients G -> exact gradients.  Every kernel is fed
+            # the SAME G (the one that belongs to the current coordinates), so
+            # all kernels follow an identical refinement trajectory; see
+            # _kernel_eval().  (Before 2026-11 the fused/SIMD paths reused a
+            # one-step-stale G, which made their gradients inexact and their
+            # R/Rfree drift by ~4e-4 from the numpy reference.)
+            (fc_atoms, gx, gb, fc_total, negll, G, mm, phase, extra) = \
+                self._kernel_eval(xyz, b_iso, occ, fcf)
             fg, ggx, ggb, stats = self.restr.calc(xyz, b_iso)
 
             f = w * negll + fg
@@ -337,6 +401,39 @@ class Refiner:
                     d.spacegroup_name, d.d_min, d.d_max))
         self.log("  solvent=%s  ML params=%d bins  MLHL=%s  ncyc=%d maxiter=%d"
                  % (o.solvent, o.n_bins, o.use_phase_prior, o.ncyc, o.maxiter))
+        self.log("  kernel=%s  (%s)" % (self.kernel, self.kernel_reason))
+        if self.kernel == "fft":
+            _sp = (o.fft_spacing if o.fft_spacing is not None else
+                   fftcalc.auto_spacing(d.cell, getattr(d, "d_min", None),
+                                        b_min=float(np.min(d.b_iso))))
+            _nu = [max(1, int(round(v / _sp))) for v in
+                   (d.cell.a, d.cell.b, d.cell.c)]
+            self.log("  fft grid: %.3f A spacing -> %dx%dx%d voxels (%.0f MB); "
+                     "Fc error ~0.1 %%, use --fft-spacing to trade speed"
+                     % (_sp, _nu[0], _nu[1], _nu[2],
+                        _nu[0] * _nu[1] * _nu[2] * 8.0 / 1e6))
+            self.fft_spacing = float(_sp)
+        fi = getattr(d, "free_info", {}) or {}
+        if fi.get("mode") == "absent":
+            self.log("  free set: NONE (no FreeR_flag column) -> Rfree unavailable")
+        else:
+            self.log("  free set: %s=%d -> %d of %d observed reflections (%.1f %%)"
+                     % (d.free_label, d.free_value, int(np.sum(d.test)),
+                        int(np.sum(d.observed)),
+                        100.0 * float(fi.get("free_fraction", 0.0))))
+        st = getattr(d, "data_stats", {}) or {}
+        if st.get("n_missing_f"):
+            self.log("  note: %d reflections with F<=0 / missing are excluded "
+                     "from the target" % st["n_missing_f"])
+        if st.get("n_bad_sigma"):
+            self.log("  note: %d reflections have a missing/invalid sigma "
+                     "(median substituted)" % st["n_bad_sigma"])
+        if st.get("n_altloc_atoms"):
+            self.log("  note: %d atoms with altloc other than blank/A were skipped"
+                     % st["n_altloc_atoms"])
+        if st.get("n_duplicate_hkl"):
+            self.log("  WARNING: %d duplicate HKL rows in the input MTZ"
+                     % st["n_duplicate_hkl"])
         self.log("=" * 78)
 
         self._prepare()
@@ -396,18 +493,37 @@ class Refiner:
             self.log("  wrote %s" % o.out_pdb)
         if o.out_mtz:
             # one extra Fc evaluation so FC/PHIC can be the atom-only
-            # contribution (REFMAC's FC column excludes the bulk solvent).
+            # contribution (REFMAC's FC column is atom-only as well; FC_ALL is
+            # the total including the bulk solvent -- verified against
+            # refmac5 5.8 on the 7enm test data).
             fc_atoms_final = sfcalc.calc_fc(d, xyz, b_iso, d.occ)
+            last = self.cycles[-1] if self.cycles else None
+            hist = [
+                "MINIREFMAC version=%s kernel=%s" % (__version__, self.kernel),
+                "MINIREFMAC ncyc=%d maxiter=%d bins=%d solvent=%s"
+                % (o.ncyc, o.maxiter, o.n_bins, o.solvent),
+                "MINIREFMAC free_column=%s free_value=%d n_free=%d n_work=%d"
+                % (d.free_label or "none", d.free_value,
+                   int(np.sum(d.test)), int(np.sum(d.work))),
+            ]
+            if last is not None:
+                hist.append("MINIREFMAC R_work=%.4f R_free=%.4f negll=%.2f"
+                            % (last.r_work, last.r_free, last.negll))
+                hist.append("MINIREFMAC NOTE printed R uses the observed scale "
+                            "with the per-reflection scale k; this file is on "
+                            "the absolute scale, so recompute as "
+                            "sum|F_obs - k*FC_ALL|/sum F_obs (see README)")
             maps.write_output_mtz(d, o.out_mtz, fc_total, self.scale,
                                   self.mlpar, self.last_m, self.last_phase,
                                   xyz, b_iso, extra_columns=True,
                                   output_scale=o.map_scale,
-                                  fc_atoms=fc_atoms_final)
+                                  fc_atoms=fc_atoms_final,
+                                  history_extra=hist)
             self.log("  wrote %s (scale=%s)" % (o.out_mtz, o.map_scale))
 
         total = time.time() - t_start
         result = dict(
-            version="minirefmac 0.1.0",
+            version="minirefmac %s" % __version__,
             mtz=d.mtz_path, pdb=d.pdb_path,
             spacegroup=d.spacegroup_name, n_ref=d.n_ref,
             n_atoms=d.n_atoms, d_min=d.d_min, d_max=d.d_max,
@@ -421,6 +537,19 @@ class Refiner:
                        rmsz_bond=self.cycles[-1].rmsz_bond),
             n_target_evals=self.n_eval,
             map_scale=o.map_scale,
+            kernel=self.kernel,
+            kernel_reason=self.kernel_reason,
+            fft_spacing=getattr(self, "fft_spacing", None),
+            free=dict(label=d.free_label, value=int(d.free_value),
+                      n_free=int(np.sum(d.test)), n_work=int(np.sum(d.work)),
+                      fraction=float((getattr(d, "free_info", {}) or {}).get(
+                          "free_fraction", 0.0)),
+                      mode=(getattr(d, "free_info", {}) or {}).get("mode")),
+            data_stats=dict(getattr(d, "data_stats", {}) or {}),
+            r_definition=("R = sum|F_obs - k*|Fc|| / sum F_obs (observed scale, "
+                          "per-reflection k).  The output MTZ is written on the "
+                          "absolute scale, so recomputing R from it gives a "
+                          "slightly different value; see README_LINUX.md."),
             final_scale_params=self.scale.as_dict(),
             best_rfree=float(self.best_rfree),
             best_rfree_cycle=int(self.best_rfree_cycle),

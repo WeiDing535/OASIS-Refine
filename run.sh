@@ -6,8 +6,16 @@
 #
 # Only gemmi / numpy / scipy from PyPI are needed.  The restraint dictionary
 # is bundled in minirefmac/data/ -- no external files are read at runtime.
+#
+# Interpreter precedence: $PYTHON > local .venv/bin/python > python3.
 set -e
 HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-PYTHON=${PYTHON:-python3}
+if [ -n "${PYTHON:-}" ]; then
+    PY="$PYTHON"
+elif [ -x "$HERE/.venv/bin/python" ]; then
+    PY="$HERE/.venv/bin/python"
+else
+    PY=python3
+fi
 cd "$HERE"
-exec "$PYTHON" -m minirefmac.cli "$@"
+exec "$PY" -m minirefmac "$@"

@@ -123,6 +123,15 @@ class RefineData:
     d_min: float = 0.0
     d_max: float = 0.0
 
+    # ---- diagnostics (filled by dataio.load_data) --------------------
+    # free_info : how the FreeR flag value was chosen (explicit / auto),
+    #             the flag histogram and the resulting free fraction.
+    # data_stats: reflection-level sanity counters (missing F, bad sigma,
+    #             duplicate HKL, altlocs, ...).  Reported in refine.log and
+    #             report.json so a silently wrong input never goes unnoticed.
+    free_info: Dict[str, Any] = field(default_factory=dict)
+    data_stats: Dict[str, Any] = field(default_factory=dict)
+
     # precomputed scattering factors f_j(h), shape (N,M)
     sf_table: np.ndarray = None
     # Low-memory alternative: one IT92 curve per distinct element plus the

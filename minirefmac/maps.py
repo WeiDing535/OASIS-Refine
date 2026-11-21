@@ -242,7 +242,7 @@ def _hkl_rows(mtz, data):
 
 def write_output_mtz(data, path, fc_total, scale, mlpar, m, phase,
                      xyz, b_iso, extra_columns=True,
-                     output_scale="absolute", fc_atoms=None):
+                     output_scale="absolute", fc_atoms=None, history_extra=None):
     """Copy data.mtz, add/overwrite the map columns and write ``path``.
 
     xyz / b_iso are kept in the signature to match the core.py contract; the
@@ -328,6 +328,8 @@ def write_output_mtz(data, path, fc_total, scale, mlpar, m, phase,
     history.append("MINIREFMAC FC/PHIC atom-only"
                    if fc_atoms is not None else
                    "MINIREFMAC FC/PHIC = FC_ALL (no fc_atoms)")
+    if history_extra:
+        history.extend(str(h) for h in history_extra)
     mtz.history = history
 
     mtz.write_to_file(path)

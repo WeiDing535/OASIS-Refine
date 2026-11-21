@@ -33,6 +33,7 @@ The absolute scale is fixed from the h=(0,0,0) term: after gemmi's FFT
 normalisation F_fft(0) = scale * sum_j Z_j (total electron count), so
 Fc(h) = (F_fft(0)/sum Z_j) * F_fft(h).  No direct-sum Fc is needed.
 """
+import math
 import numpy as np
 import gemmi
 
@@ -139,7 +140,8 @@ def fft_gradients(data, xyz, b_iso, occ, G, fc_atom_factor, symops=None,
     hkl = np.asarray(data.hkl, dtype=np.int32)
     m = xyz.shape[0]
     if spacing is None:
-        spacing = auto_spacing(cell, getattr(data, "d_min", None))
+        spacing = auto_spacing(cell, getattr(data, "d_min", None),
+                               b_min=float(np.min(data.b_iso)))
 
     # 1. build real-space density grid (same as fft_fc forward)
     if grid is None:
@@ -304,20 +306,36 @@ def _build_grid(data, spacing):
     return g
 
 
-def auto_spacing(cell, d_min=None, target=0.5, vmax=80e6):
-    """Memory-aware grid spacing for FFT structure factors.
+def auto_spacing(cell, d_min=None, target=None, vmax=80e6, b_min=None):
+    """Grid spacing (A) for FFT structure factors: accurate by default.
 
-    The grid must resolve the *sharpest real-space Gaussian* (controlled by the
-    smallest b_i term and the smallest B_iso), independent of the data
-    resolution: a sharp atom aliases at any d_min.  Empirically ~0.5 A gives a
-    global Fc error ~1e-3 (0.3 A -> ~2.5e-4), which is plenty for training-data
-    phases while keeping the O(G log G) speed win on large reflection sets.
-    `target` is inflated only if the grid would exceed `vmax` voxels (avoids OOM
-    on very large unit cells).  Pass an explicit `spacing` to override.
+    Two independent limits set the target:
+
+    * the *sharpest real-space Gaussian* -- an atom with B_min has a density
+      width sigma = sqrt(B_min / (2 pi^2)) ~ 0.45 A for B=4, and aliases at any
+      d_min unless the grid samples it; 0.6 sigma is the empirical sweet spot;
+    * the data resolution -- at least ~4 samples per d_min.
+
+    Measured on the 7enm test case (B_min ~ 4 A^2, d_min 1.70 A):
+    spacing 0.50 -> Fc rel. err 3.5e-2 (too coarse: R inflated by ~0.004),
+    0.30 -> 1.3e-2, 0.25 -> 1.0e-3, 0.20 -> 3.5e-4.
+    Hence the 0.25 A default instead of the old 0.5 A.
+
+    ``vmax`` caps the number of voxels (memory); if the cap forces a coarser
+    grid the function returns that coarser spacing -- callers should log it.
+    Pass an explicit ``target`` to override.
     """
     a, b, c = cell.a, cell.b, cell.c
-    sp = float(target)
-    for _ in range(40):
+    sp = 0.25 if target is None else float(target)
+    if b_min is not None and np.isfinite(b_min) and b_min > 0.0:
+        # B below ~3 A^2 is either a heavy atom or a refinement artefact; chasing
+        # it would need a 1000^3 grid for a 1e-4 Fc gain, far below data noise.
+        sigma = math.sqrt(max(float(b_min), 3.0) / (2.0 * math.pi ** 2))
+        sp = min(sp, max(0.6 * sigma, 0.18))
+    if d_min:
+        sp = min(sp, max(float(d_min) / 4.0, 0.08))
+    sp = max(sp, 0.08)
+    for _ in range(60):
         nu = max(1, int(round(a / sp)))
         nv = max(1, int(round(b / sp)))
         nw = max(1, int(round(c / sp)))
@@ -501,7 +519,7 @@ def fft_fc(data, spacing=None, symops=None, radius_A=None, return_grid=False,
 
     Returns a complex128 numpy array of length data.n_ref on the absolute
     scale (Fc(0) == total electron count).  `spacing=None` selects a
-    memory-aware spacing (~0.3 A) that keeps the Fc integral error small.
+    spacing from auto_spacing() (~0.25 A, adaptive; see its docstring).
     `radius_A=None` uses the per-atom adaptive density cutoff (atom_radius).
     `xyz`/`b_iso`/`occ` override data.xyz/data.b_iso/data.occ (trial model);
     `grid`/`atoms` reuse a grid already built by _scatter_density.
@@ -511,7 +529,8 @@ def fft_fc(data, spacing=None, symops=None, radius_A=None, return_grid=False,
         symops = sfcalc._sym_ops(data)
     cell = data.cell
     if spacing is None:
-        spacing = auto_spacing(cell, getattr(data, "d_min", None))
+        spacing = auto_spacing(cell, getattr(data, "d_min", None),
+                               b_min=float(np.min(data.b_iso)))
 
     if grid is None:
         g, atoms, _orth = _scatter_density(

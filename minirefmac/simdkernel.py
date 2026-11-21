@@ -17,6 +17,7 @@ The shared object _simd.so is built on demand by ensure_simd_lib() if missing.
 """
 import os
 import ctypes
+import shutil
 import numpy as np
 
 try:
@@ -25,7 +26,8 @@ except ImportError:  # pragma: no cover
     import sfcalc
 
 
-__all__ = ["simd_fc_and_gradients", "ensure_simd_lib", "HAVE_SIMD"]
+__all__ = ["simd_fc_and_gradients", "ensure_simd_lib", "HAVE_SIMD",
+           "probe", "cpu_has_avx512"]
 
 _TWO_PI = 2.0 * np.pi
 _P = ctypes.c_void_p
@@ -37,6 +39,37 @@ HAVE_SIMD = False
 
 def _lib_path():
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), "_simd.so")
+
+
+def probe():
+    """Can the AVX-512 kernel be used here?  Returns ``(ok, reason)``.
+
+    Never raises and never compiles: a stale ``_simd.so`` from another OS/CPU
+    is reported as rebuildable rather than fatal.
+    """
+    so = _lib_path()
+    if os.path.exists(so):
+        try:
+            ctypes.CDLL(so)
+            return True, "prebuilt _simd.so"
+        except OSError:
+            pass                      # stale binary -> will be rebuilt below
+    if not cpu_has_avx512():
+        return False, "CPU lacks AVX-512F/DQ/VL"
+    cc = shutil.which("clang") or shutil.which("gcc")
+    if cc is None:
+        return False, "no C compiler (clang/gcc)"
+    return True, "compiles _simd.c with %s" % os.path.basename(cc)
+
+
+def cpu_has_avx512():
+    """True when /proc/cpuinfo advertises AVX-512F + DQ + VL."""
+    try:
+        with open("/proc/cpuinfo", "r") as fh:
+            text = fh.read()
+    except OSError:
+        return False
+    return all(flag in text for flag in ("avx512f", "avx512dq", "avx512vl"))
 
 
 def ensure_simd_lib():
@@ -107,7 +140,9 @@ def simd_fc_and_gradients(data, xyz, b_iso, occ, G, fc_atom_factor,
         occ = data.occ
     occ = np.ascontiguousarray(occ, dtype=np.float64)
     G = np.ascontiguousarray(G, dtype=np.complex128)
-    fcf = np.ascontiguousarray(fc_atom_factor, dtype=np.float64)
+    # fc_atom_factor is real by construction (see fastkernel).
+    fcf = np.ascontiguousarray(np.real(np.asarray(fc_atom_factor)),
+                               dtype=np.float64)
     hkl = np.ascontiguousarray(data.hkl, dtype=np.float64)
     stol2 = np.ascontiguousarray(data.stol2, dtype=np.float64)
     ops = sfcalc._sym_ops(data)

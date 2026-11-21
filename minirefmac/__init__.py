@@ -6,4 +6,4 @@ Self-contained: the monomer restraint dictionary ships inside the package as
 CIF or prebuilt binary is read at runtime.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

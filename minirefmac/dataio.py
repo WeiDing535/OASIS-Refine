@@ -81,6 +81,75 @@ def _values(col):
     return np.asarray(col.array, dtype=np.float64)
 
 
+def resolve_free_value(free_flags, observed, free_value="auto"):
+    """Decide which ``FreeR_flag`` value marks the EXCLUDED (test) set.
+
+    ``free_value`` may be
+
+    * an ``int``  -- used verbatim (the old behaviour), or
+    * ``"auto"`` / ``None`` -- decided from the flag histogram.
+
+    Auto rule (deliberately conservative):
+
+    1. the CCP4 convention wins when it is self-consistent, i.e. flag 0 makes
+       up 1-25 % of the observed reflections -> ``0``;
+    2. otherwise the minority flag whose fraction is 1-25 % and closest to
+       5 % is used (this is the ``0 = work, 1 = free`` files produced by some
+       in-house pipelines);
+    3. otherwise fall back to ``0`` and let the caller warn.
+
+    Returns ``(value, info)``; ``info`` carries the histogram and the mode so
+    the decision can be logged and stored in report.json.
+    """
+    flags = np.rint(np.asarray(free_flags, dtype=np.float64)).astype(np.int64)
+    obs = np.asarray(observed, dtype=bool)
+    sel = flags[obs] if obs.any() else flags
+    n = max(int(sel.size), 1)
+    vals, counts = np.unique(sel, return_counts=True)
+    frac = {int(v): float(c) / n for v, c in zip(vals, counts)}
+    info = {
+        "requested": str(free_value),
+        "mode": "explicit",
+        "flag_values": [int(v) for v in vals],
+        "flag_counts": [int(c) for c in counts],
+        "flag_fractions": {int(v): round(f, 6) for v, f in frac.items()},
+        "chosen": None,
+        "n_observed": n,
+    }
+
+    if isinstance(free_value, str) and free_value.strip().lower() not in ("", "auto"):
+        free_value = int(free_value)
+    if isinstance(free_value, (int, np.integer)):
+        info["chosen"] = int(free_value)
+        info["free_fraction"] = round(frac.get(int(free_value), 0.0), 6)
+        if info["free_fraction"] > 0.30:
+            info["suspicious"] = True
+        return int(free_value), info
+
+    def usable(f):
+        return 0.01 <= f <= 0.25
+
+    chosen = None
+    if 0 in frac and usable(frac[0]):
+        chosen = 0
+    else:
+        cand = [(v, f) for v, f in frac.items() if v != 0 and usable(f)]
+        if cand:
+            chosen = min(cand, key=lambda vf: abs(vf[1] - 0.05))[0]
+    if chosen is None:
+        chosen = 0
+        info["fallback"] = True
+    info["mode"] = "auto"
+    info["chosen"] = int(chosen)
+    info["free_fraction"] = round(frac.get(int(chosen), 0.0), 6)
+    # A "free" set larger than 30 % is almost always a mis-read convention:
+    # Rfree then measures the work set and the number is meaningless.  The
+    # caller (load_data) warns once with the column name attached.
+    if info["free_fraction"] > 0.30:
+        info["suspicious"] = True
+    return int(chosen), info
+
+
 def _resolve_element(symbol):
     """gemmi Element, with unknown/pseudo atoms ('X','MSE',...) -> carbon."""
     try:
@@ -216,10 +285,15 @@ def write_refined_pdb(data, xyz, b_iso, path):
 
 # ---- main loader --------------------------------------------------------
 def load_data(mtz_path, pdb_path, fp_label=None, sigfp_label=None,
-              free_label=None, free_value=0, phib_label=None, fom_label=None,
+              free_label=None, free_value="auto", phib_label=None, fom_label=None,
               hla_label=None, hlb_label=None, hlc_label=None, hld_label=None,
               d_min=0.0, d_max=0.0, keep_hydrogens=False):
-    """Read an MTZ + PDB/mmCIF and assemble a RefineData instance."""
+    """Read an MTZ + PDB/mmCIF and assemble a RefineData instance.
+
+    ``free_value`` is the FreeR_flag value that marks the EXCLUDED (test) set.
+    ``"auto"`` (default) honours the CCP4 convention (0 = free) when flag 0 is
+    a 1-25 % minority, otherwise picks the minority flag closest to 5 %.
+    """
     mtz = gemmi.read_mtz_file(mtz_path)
     st = gemmi.read_structure(pdb_path)
     cell = mtz.cell
@@ -343,7 +417,38 @@ def load_data(mtz_path, pdb_path, fp_label=None, sigfp_label=None,
         if not np.isfinite(med) or med <= 0:
             med = 1.0
         sigfo[bad] = med
-    is_free = (free == int(free_value))
+
+    # Which FreeR_flag value is the EXCLUDED (test) set?  Default is "auto":
+    # the CCP4 convention (0 = free) when flag 0 is a plausible minority,
+    # otherwise the minority flag closest to 5 %.  This prevents the classic
+    # silent failure of a 0=work/1=free file being refined with 95 % of the
+    # data in the "free" set (Rfree then means nothing).
+    if free_col is None:
+        # No flag column at all: everything is work.  (Previously the zero
+        # placeholder made every reflection "free" and the refinement a no-op.)
+        free_value_used = -1
+        is_free = np.zeros(len(free), dtype=bool)
+        free_info = dict(mode="absent", chosen=-1, free_fraction=0.0,
+                         requested=str(free_value), flag_values=[],
+                         flag_counts=[], flag_fractions={},
+                         n_observed=int(np.sum(observed)))
+    else:
+        free_value_used, free_info = resolve_free_value(free, observed, free_value)
+        is_free = (free == int(free_value_used))
+
+    frac_free = (float(np.sum(is_free & observed)) / float(np.sum(observed))
+                 if np.any(observed) else 0.0)
+    free_info["free_fraction"] = round(frac_free, 6)
+    if free_col is not None and not (0.01 <= frac_free <= 0.25):
+        warnings.warn(
+            "free set is %.1f %% of the observed reflections (flag %d, "
+            "column %r).  Expected 2-10 %%: check --free-value / the flag "
+            "convention, otherwise Rfree is meaningless."
+            % (100.0 * frac_free, int(free_value_used), free_col.label))
+
+    n_dup = int(len(hkl) - len(np.unique(hkl, axis=0)))
+    if n_dup:
+        warnings.warn("%d duplicate HKL rows in the input MTZ" % n_dup)
 
     # ---- model atoms ----------------------------------------------------
     xyz_l, b_l, occ_l = [], [], []
@@ -385,7 +490,21 @@ def load_data(mtz_path, pdb_path, fp_label=None, sigfp_label=None,
         mtz_path=mtz_path, pdb_path=pdb_path,
         fp_label=fp_col.label, sigfp_label=sig_col.label,
         free_label=(free_col.label if free_col is not None else ""),
-        free_value=int(free_value),
+        free_value=int(free_value_used),
+        free_info=free_info,
+        data_stats=dict(
+            n_ref=int(len(hkl)),
+            n_observed=int(np.sum(observed)),
+            n_missing_f=int(np.sum(~np.isfinite(fo) | (fo <= 0.0))),
+            n_bad_sigma=int(np.sum(bad)),
+            n_duplicate_hkl=n_dup,
+            n_free=int(np.sum(is_free & observed)),
+            n_work=int(np.sum(observed & ~is_free)),
+            free_fraction=round(frac_free, 6),
+            n_altloc_atoms=int(sum(1 for a in altlocs if a not in _ALTLOC_OK)),
+            n_hydrogen_atoms=int(np.sum(is_h)) if len(is_h) else 0,
+            n_atoms=len(xyz_l),
+        ),
         # report the ACTUAL resolution limits of the retained reflections
         # (0/0 in the arguments means "no filter was requested")
         d_min=float(np.min(d)) if len(d) else float(d_min),

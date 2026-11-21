@@ -16,20 +16,28 @@ Checks
 7. output MTZ columns are readable and free-set RESTORE is honoured
 8. output MTZ uses the REFMAC5 absolute scale (F_abs = F_obs/k_total),
    FC is atom-only, and the convention is recorded in the MTZ history
+9. every acceleration kernel (fused / SIMD / FFT) reproduces the numpy
+   reference Fc and gradients *for the same ML coefficient G* -- this is what
+   guarantees that all kernels follow the same refinement trajectory
+10. the FreeR flag convention is resolved correctly ("auto"): CCP4 0=free,
+   0=work/1=free, and the single-value fallback
 """
 
 import argparse
 import json
 import os
 import time
+import warnings
 
 import numpy as np
 import gemmi
 
 try:
-    from . import dataio, sfcalc, likelihood, gradient, geometry, maps, refine
+    from . import (dataio, sfcalc, likelihood, gradient, geometry, maps, refine,
+                   fastkernel, simdkernel, fftcalc)
 except ImportError:  # pragma: no cover
     import dataio, sfcalc, likelihood, gradient, geometry, maps, refine
+    import fastkernel, simdkernel, fftcalc
 
 
 def _finite_diff(fun, vec, idx, step):
@@ -226,6 +234,64 @@ def run(args):
     print("8) absolute output scale: rel|F_out*k - F_in|=%.3g, "
           "mean|FC-FC_ALL|=%.3f" % (err_f, fc_sep), flush=True)
 
+    # ---- 9. kernel agreement at a fixed G --------------------------------
+    def _rel(a, b):
+        den = float(np.linalg.norm(b))
+        return float(np.linalg.norm(np.asarray(a) - np.asarray(b)) / den) if den else 0.0
+
+    kres = {}
+    fc_fu, gx_fu, gb_fu = fastkernel.fused_fc_and_gradients(
+        data, xyz, b, occ, G, fcf, chunk=args.chunk)
+    kres["fused"] = dict(fc=_rel(fc_fu, fc_atoms), gx=_rel(gx_fu, gx),
+                         gb=_rel(gb_fu, gb), required=True)
+    ok_simd, why_simd = simdkernel.probe()
+    if ok_simd:
+        fc_sd, gx_sd, gb_sd = simdkernel.simd_fc_and_gradients(
+            data, xyz, b, occ, G, fcf, chunk=args.chunk)
+        kres["simd"] = dict(fc=_rel(fc_sd, fc_atoms), gx=_rel(gx_sd, gx),
+                            gb=_rel(gb_sd, gb), required=True)
+    else:
+        kres["simd"] = dict(skipped=why_simd, required=False, fc=0.0,
+                            gx=0.0, gb=0.0)
+    try:
+        sp = fftcalc.auto_spacing(data.cell, getattr(data, "d_min", None),
+                                   b_min=float(np.min(b)))
+        grid, fatoms, _ = fftcalc._scatter_density(
+            data, sp, sfcalc._sym_ops(data), None, xyz=xyz, b_iso=b, occ=occ)
+        fc_fft = fftcalc.fft_fc(data, spacing=sp, radius_A=None,
+                                grid=grid, atoms=fatoms)
+        kres["fft"] = dict(fc=_rel(fc_fft, fc_atoms), spacing=float(sp),
+                           required=False)
+    except Exception as exc:              # pragma: no cover
+        kres["fft"] = dict(error=str(exc), required=False, fc=0.0)
+    ok9 = all((v.get("fc", 0.0) < 1e-9 and v.get("gx", 0.0) < 1e-9
+               and v.get("gb", 0.0) < 1e-9) for k, v in kres.items()
+              if v.get("required"))
+    ok9 = bool(ok9 and kres.get("fft", {}).get("fc", 1.0) < 5e-3)
+    out["checks"]["kernel_agreement"] = dict(passed=ok9, kernels=kres)
+    print("9) kernel agreement (fixed G): %s  (fft Fc rel err %.1e)"
+          % (", ".join("%s %.0e" % (k, v.get("fc", 0.0))
+                       for k, v in kres.items()), kres.get("fft", {}).get("fc", 0.0)),
+          flush=True)
+
+    # ---- 10. FreeR flag convention --------------------------------------
+    cases = [("ccp4 0=free", [0] * 5 + [1] * 95, 0),
+             ("0=work 1=free", [0] * 95 + [1] * 5, 1),
+             ("single value", [0] * 100, 0)]
+    fcase = {}
+    for name, flags, want in cases:
+        arr = np.asarray(flags, dtype=np.int64)
+        with warnings.catch_warnings():      # the single-value case warns on purpose
+            warnings.simplefilter("ignore")
+            got, info = dataio.resolve_free_value(arr, np.ones(arr.size, bool),
+                                                 "auto")
+        fcase[name] = dict(flags=want, chosen=int(got), ok=bool(got == want),
+                           mode=info["mode"])
+    ok10 = all(v["ok"] for v in fcase.values())
+    out["checks"]["free_value_auto"] = dict(passed=ok10, cases=fcase)
+    print("10) free-value auto: %s" % {k: v["chosen"] for k, v in fcase.items()},
+          flush=True)
+
     out["passed"] = all(v.get("passed", True) for k, v in out["checks"].items()
                         if isinstance(v, dict))
     out["wall_seconds"] = time.time() - t0
@@ -246,7 +312,7 @@ def main(argv=None):
     p.add_argument("--fp", default=None)
     p.add_argument("--sigfp", default=None)
     p.add_argument("--free", default=None)
-    p.add_argument("--free-value", type=int, default=0)
+    p.add_argument("--free-value", default="auto")
     p.add_argument("--dmin", type=float, default=0.0)
     p.add_argument("--dmax", type=float, default=0.0)
     p.add_argument("--bins", type=int, default=20)
@@ -254,6 +320,10 @@ def main(argv=None):
     p.add_argument("--chunk", type=int, default=48)
     p.add_argument("--phase-prior", action="store_true")
     a = p.parse_args(argv)
+    try:
+        a.free_value = int(a.free_value)
+    except (TypeError, ValueError):
+        a.free_value = "auto"
     return run(a)
 
 

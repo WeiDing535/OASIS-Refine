@@ -229,7 +229,9 @@ def fused_fc_and_gradients(data, xyz, b_iso, occ, G, fc_atom_factor,
         occ = data.occ
     occ = np.asarray(occ, dtype=np.float64)
     G = np.asarray(G, dtype=np.complex128)
-    fcf = np.asarray(fc_atom_factor, dtype=np.float64)   # (N,) real
+    # fc_atom_factor is real by construction (bulk-solvent factor); be
+    # explicit so a stray complex array cannot be silently truncated.
+    fcf = np.asarray(np.real(np.asarray(fc_atom_factor)), dtype=np.float64)
     hkl = np.asarray(data.hkl, dtype=np.float64)         # (N,3)
     stol2 = np.asarray(data.stol2, dtype=np.float64)     # (N,)
     ops = sfcalc._sym_ops(data)                          # full-cell ops
