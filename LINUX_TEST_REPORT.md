@@ -159,8 +159,11 @@ HISTORY: MINIREFMAC version=0.2.0 kernel=simd / output_scale=absolute / F_abs = 
 - `python -m minirefmac` 与 `python -m minirefmac.cli` 等价
 - `run.sh` 现在优先用本地 `.venv/bin/python`，其次 `$PYTHON`，最后 `python3`
 - 从任意工作目录调用、`PYTHONPATH=/tmp` 干扰下均正常
-- `pack_release.sh` 产物：`oasis-refine-0.2.0.tar.gz`（46 MB，35 个文件），
+- `pack_release.sh` 产物：`oasis-refine-0.2.0.tar.gz`（46 MB，36 个文件），
   解包后 `sha256sum -c MANIFEST.sha256` 全 OK，`import minirefmac` 正常
+- **全新解包复测**：把 tarball 解到空目录、用 uv 建全新 venv 装依赖
+  （包里没有 `.venv`、没有 `_simd.so`），`./run_linux_test.sh --checks-only`
+  → 5 阶段全 PASS（72 s），`_simd.so` 在解包目录内自动重编成功
 
 ---
 
@@ -216,3 +219,4 @@ HISTORY: MINIREFMAC version=0.2.0 kernel=simd / output_scale=absolute / F_abs = 
 - [x] 3056 原子真实数据规模（20.6 s / 周期，auto free 判定正确）
 - [x] 任意工作目录 / PYTHONPATH 干扰下运行
 - [x] `pack_release.sh` 打包 → 解包 → MANIFEST 校验 → import 全链路
+- [x] tarball 全新解包 + 全新 venv 复测（无预置 `.venv` / `_simd.so`）：5 阶段 PASS，72 s
