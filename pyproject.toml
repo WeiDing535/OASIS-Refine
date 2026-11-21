@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "minirefmac"
+version = "0.1.0"
+description = "From-scratch REFMAC5-like maximum-likelihood macromolecular refinement, with a self-contained monomer dictionary"
+requires-python = ">=3.8"
+dependencies = [
+    "gemmi>=0.6.5",
+    "numpy>=1.20",
+    "scipy>=1.7",
+]
+
+[project.scripts]
+minirefmac = "minirefmac.cli:main"
+
+[tool.setuptools]
+packages = ["minirefmac", "minirefmac.data"]
+
+[tool.setuptools.package-data]
+# The bundled restraint dictionary MUST ship with the package; runtime never
+# reads an external dictionary directory.
+"minirefmac.data" = ["monlib_bundle.zip", "LICENSE-CCP4-MONOMERS.txt"]
+# Optional AVX-512 kernel source; the shared object is built on demand.
+"minirefmac" = ["_simd.c"]

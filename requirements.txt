@@ -1,0 +1,15 @@
+# minirefmac runtime dependencies -- all plain PyPI packages.
+#
+# Fully self-contained: the restraint dictionary ships inside the package as
+# minirefmac/data/monlib_bundle.zip.  No external suite, no external CIFs and
+# no local binaries are read at runtime.
+#
+#   python -m venv .venv && .venv/bin/pip install -r requirements.txt
+#   .venv/bin/python -m minirefmac.cli --help
+#
+# tools/build_monlib_bundle.py is BUILD-TIME ONLY: it regenerates the bundled
+# dictionary from a source monomer-library directory.
+
+gemmi>=0.6.5
+numpy>=1.20
+scipy>=1.7
