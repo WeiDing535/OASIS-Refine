@@ -18,6 +18,9 @@ The shared object _simd.so is built on demand by ensure_simd_lib() if missing.
 import os
 import ctypes
 import shutil
+import subprocess
+import tempfile
+from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 
 try:
@@ -47,72 +50,70 @@ def probe():
     Never raises and never compiles: a stale ``_simd.so`` from another OS/CPU
     is reported as rebuildable rather than fatal.
     """
-    so = _lib_path()
-    if os.path.exists(so):
-        try:
-            ctypes.CDLL(so)
-            return True, "prebuilt _simd.so"
-        except OSError:
-            pass                      # stale binary -> will be rebuilt below
     if not cpu_has_avx512():
-        return False, "CPU lacks AVX-512F/DQ/VL"
+        return False, "CPU lacks AVX-512F/DQ/VL and FMA"
+    if HAVE_SIMD or _read_library(_lib_path()) is not None:
+        return True, "prebuilt _simd.so"
     cc = shutil.which("clang") or shutil.which("gcc")
     if cc is None:
-        return False, "no C compiler (clang/gcc)"
+        return False, "no compatible _simd.so and no C compiler (clang/gcc)"
     return True, "compiles _simd.c with %s" % os.path.basename(cc)
 
 
 def cpu_has_avx512():
-    """True when /proc/cpuinfo advertises AVX-512F + DQ + VL."""
+    """Check the required CPU flags on all processors visible to Linux."""
+    required = {"avx512f", "avx512dq", "avx512vl", "fma"}
     try:
         with open("/proc/cpuinfo", "r") as fh:
-            text = fh.read()
+            flags = [line.partition(":")[2].split()
+                     for line in fh if line.partition(":")[0].strip() == "flags"]
     except OSError:
         return False
-    return all(flag in text for flag in ("avx512f", "avx512dq", "avx512vl"))
+    return bool(flags) and all(required.issubset(cpu) for cpu in flags)
+
+
+def _read_library(path):
+    try:
+        lib = ctypes.CDLL(path)
+        panel = lib.simd_fc_grad_panel_v2
+        panel.argtypes = [_P] * 8 + [_I] * 2 + [_P] * 4
+        panel.restype = None
+    except (OSError, AttributeError):
+        return None
+    return lib
 
 
 def ensure_simd_lib():
-    """Build _simd.so if it does not exist. Returns True if usable."""
+    """Load a compatible SIMD library, compiling and publishing it if needed."""
     global _lib, HAVE_SIMD
     if _lib is not None:
-        return HAVE_SIMD
-    so = _lib_path()
-    if not os.path.exists(so):
-        try:
-            import subprocess
-            src = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_simd.c")
-            import shutil
-            cc = shutil.which("clang") or shutil.which("gcc")
-            if cc is None:
-                print("simdkernel: no C compiler found (clang / gcc)")
-                HAVE_SIMD = False
-                return False
-            r = subprocess.run(
-                [cc, "-O3", "-mavx512f", "-mavx512dq", "-mavx512vl",
-                 "-mfma", "-funroll-loops", "-shared", "-fPIC",
-                 "-o", so, src], capture_output=True, text=True)
-            if r.returncode != 0 or not os.path.exists(so):
-                print("simdkernel: build failed:\n", r.stderr)
-                HAVE_SIMD = False
-                return False
-        except Exception as exc:
-            print("simdkernel: build error:", exc)
-            HAVE_SIMD = False
-            return False
-    try:
-        lib = ctypes.CDLL(so)
-        lib.simd_fc_grad_panel.argtypes = [
-            _P, _P, _P, _P, _P, _P, _P, _P, _I, _I, _P, _P, _P, _P]
-        lib.simd_fc_grad_panel.restype = None
-    except (OSError, AttributeError) as exc:
-        # A stale shared object from another OS / CPU cannot be loaded.
-        # Nothing in the default refinement path needs it; removing the file
-        # makes ensure_simd_lib() rebuild it locally from _simd.c on next use.
-        print("simdkernel: cannot load %s (%s). Remove it to rebuild from "
-              "_simd.c, or run without --simd-kernel." % (so, exc))
-        HAVE_SIMD = False
+        return True
+    if not cpu_has_avx512():
         return False
+    so = _lib_path()
+    lib = _read_library(so)
+    if lib is None:
+        cc = shutil.which("clang") or shutil.which("gcc")
+        if cc is None:
+            return False
+        src = os.path.join(os.path.dirname(so), "_simd.c")
+        try:
+            with tempfile.TemporaryDirectory(prefix=".simd-", dir=os.path.dirname(so)) as tmp:
+                built = os.path.join(tmp, "_simd.so")
+                result = subprocess.run(
+                    [cc, "-O3", "-mavx512f", "-mavx512dq", "-mavx512vl",
+                     "-mfma", "-funroll-loops", "-shared", "-fPIC",
+                     "-o", built, src], capture_output=True, text=True)
+                if result.returncode:
+                    print("simdkernel: build failed:\n", result.stderr)
+                    return False
+                lib = _read_library(built)
+                if lib is None:
+                    return False
+                os.replace(built, so)
+        except OSError as exc:
+            print("simdkernel: build error:", exc)
+            return False
     _lib = lib
     HAVE_SIMD = True
     return True
@@ -125,13 +126,17 @@ def _load():
 
 
 def simd_fc_and_gradients(data, xyz, b_iso, occ, G, fc_atom_factor,
-                          chunk=48, exp_mode=None):
+                          chunk=48, exp_mode=None, *, want_fc=True, want_grad=True,
+                          threads=1):
     """Return (fc, grad_xyz, grad_b) with the AVX-512 inner loop.
 
     Same contract as fastkernel.fused_fc_and_gradients: for a GIVEN ``G`` the
     returned arrays match the numpy reference to ~1e-13 (SIMD sincos accuracy);
     pass the SAME G to both to compare.  exp_mode is accepted only for API
-    compatibility with the numpy kernel and is ignored (the C path is exact).
+    compatibility with the numpy kernel and is ignored. Disabled outputs are
+    returned as None. With multiple workers, Fc-only calls partition
+    reflections, preserving the atom summation order for each reflection.
+    Gradient calls partition atoms.
     """
     n, m = data.n_ref, data.n_atoms
     xyz = np.ascontiguousarray(xyz, dtype=np.float64)
@@ -139,53 +144,83 @@ def simd_fc_and_gradients(data, xyz, b_iso, occ, G, fc_atom_factor,
     if occ is None:
         occ = data.occ
     occ = np.ascontiguousarray(occ, dtype=np.float64)
-    G = np.ascontiguousarray(G, dtype=np.complex128)
-    # fc_atom_factor is real by construction (see fastkernel).
-    fcf = np.ascontiguousarray(np.real(np.asarray(fc_atom_factor)),
-                               dtype=np.float64)
-    hkl = np.ascontiguousarray(data.hkl, dtype=np.float64)
     stol2 = np.ascontiguousarray(data.stol2, dtype=np.float64)
     ops = sfcalc._sym_ops(data)
     lib = _load()
 
-    AG = np.conj(G) * fcf
-    AG_re = np.ascontiguousarray(AG.real, dtype=np.float64)
-    AG_im = np.ascontiguousarray(AG.imag, dtype=np.float64)
+    ag_re = ag_im = None
+    if want_grad:
+        ag = np.conj(np.asarray(G, dtype=np.complex128)) * np.real(fc_atom_factor)
+        ag_re = np.ascontiguousarray(ag.real).ctypes.data_as(_P)
+        ag_im = np.ascontiguousarray(ag.imag).ctypes.data_as(_P)
     # hkl must be COLUMN-MAJOR (3 x n_ref) for the SIMD kernel; each Miller
     # index column hklT[k*n_ref+n] = hkl[n,k] is contiguous.
     hklT = np.ascontiguousarray(data.hkl.T, dtype=np.float64)
 
-    fc_re = np.zeros(n, dtype=np.float64)
-    fc_im = np.zeros(n, dtype=np.float64)
-    grad_xyz = np.zeros((m, 3), dtype=np.float64)
-    grad_b = np.zeros(m, dtype=np.float64)
+    grad_xyz = np.zeros((m, 3), dtype=np.float64) if want_grad else None
+    grad_b = np.zeros(m, dtype=np.float64) if want_grad else None
+    op_ptrs = [(R.ctypes.data_as(_P), t.ctypes.data_as(_P)) for R, t in ops]
 
     chunk = max(1, int(chunk))
-    for c0 in range(0, m, chunk):
-        c1 = min(c0 + chunk, m)
-        nc = c1 - c0
-        xc = np.ascontiguousarray(xyz[c0:c1], dtype=np.float64)     # (nc,3)
-        bc = b_iso[c0:c1]
-        oc = occ[c0:c1]
-        sfc = data.sf_block(c0, c1)                                # (N,nc)
-        W = (oc[None, :] * sfc) * np.exp(-bc[None, :] * stol2[:, None])  # (N,nc)
-        Wt = np.ascontiguousarray(W.T, dtype=np.float64)           # (nc,N)
-        gx_chunk = np.zeros((nc, 3), dtype=np.float64)
-        gb_chunk = np.zeros(nc, dtype=np.float64)
-        for (R, t) in ops:
-            Rarr = np.ascontiguousarray(np.asarray(R, dtype=np.float64).reshape(3, 3),
-                                        dtype=np.float64)
-            tarr = np.ascontiguousarray(np.asarray(t, dtype=np.float64).reshape(3),
-                                       dtype=np.float64)
-            lib.simd_fc_grad_panel(
-                hklT.ctypes.data_as(_P), AG_re.ctypes.data_as(_P), AG_im.ctypes.data_as(_P),
-                Rarr.ctypes.data_as(_P), tarr.ctypes.data_as(_P),
-                xc.ctypes.data_as(_P), Wt.ctypes.data_as(_P), stol2.ctypes.data_as(_P),
-                _I(n), _I(nc),
-                fc_re.ctypes.data_as(_P), fc_im.ctypes.data_as(_P),
-                gx_chunk.ctypes.data_as(_P), gb_chunk.ctypes.data_as(_P))
-        grad_xyz[c0:c1] = -_TWO_PI * gx_chunk
-        grad_b[c0:c1] = gb_chunk
+    n_chunks = (m + chunk - 1) // chunk
+    n_tiles = (n + 63) // 64
+    split_reflections = want_fc and not want_grad
+    workers = min(max(1, int(threads)), max(1, n_tiles if split_reflections else n_chunks))
 
-    fc = fc_re + 1j * fc_im
+    def panels(first, last, ref_start=0, ref_stop=n):
+        n_local = ref_stop - ref_start
+        local_hkl = np.ascontiguousarray(hklT[:, ref_start:ref_stop])
+        local_stol2 = stol2[ref_start:ref_stop]
+        hkl_ptr = local_hkl.ctypes.data_as(_P)
+        stol2_ptr = local_stol2.ctypes.data_as(_P)
+        fc_re = np.zeros(n_local, dtype=np.float64) if want_fc else None
+        fc_im = np.zeros(n_local, dtype=np.float64) if want_fc else None
+        fc_re_ptr = fc_re.ctypes.data_as(_P) if want_fc else None
+        fc_im_ptr = fc_im.ctypes.data_as(_P) if want_fc else None
+        for c0 in range(first * chunk, last * chunk, chunk):
+            c1 = min(c0 + chunk, m)
+            nc = c1 - c0
+            xc = xyz[c0:c1]
+            bc = b_iso[c0:c1]
+            oc = occ[c0:c1]
+            if n_local == n:
+                sfc = data.sf_block(c0, c1)
+            else:
+                sfc = data.sf_block(c0, c1, slice(ref_start, ref_stop))
+            W = (oc[None, :] * sfc) * np.exp(-bc[None, :] * local_stol2[:, None])
+            Wt = np.ascontiguousarray(W.T, dtype=np.float64)
+            # The gradient slices belong exclusively to this worker.
+            gx_chunk = grad_xyz[c0:c1].ctypes.data_as(_P) if want_grad else None
+            gb_chunk = grad_b[c0:c1].ctypes.data_as(_P) if want_grad else None
+            xc_ptr = xc.ctypes.data_as(_P)
+            wt_ptr = Wt.ctypes.data_as(_P)
+            for R_ptr, t_ptr in op_ptrs:
+                lib.simd_fc_grad_panel_v2(
+                    hkl_ptr, ag_re, ag_im, R_ptr, t_ptr,
+                    xc_ptr, wt_ptr, stol2_ptr, n_local, nc, fc_re_ptr, fc_im_ptr,
+                    gx_chunk, gb_chunk)
+        return fc_re, fc_im
+
+    if workers == 1:
+        fc_re, fc_im = panels(0, n_chunks)
+    elif split_reflections:
+        edges = [min(n, (i * n_tiles // workers) * 64) for i in range(workers + 1)]
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(panels, 0, n_chunks, start, stop)
+                       for start, stop in zip(edges, edges[1:])]
+            real, imag = zip(*(f.result() for f in futures))
+        fc_re, fc_im = np.concatenate(real), np.concatenate(imag)
+    else:
+        boundaries = [i * n_chunks // workers for i in range(workers + 1)]
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            partials = pool.map(panels, boundaries[:-1], boundaries[1:])
+            fc_re, fc_im = next(partials)
+            for real, imag in partials:
+                if want_fc:
+                    fc_re += real
+                    fc_im += imag
+
+    if want_grad:
+        grad_xyz *= -_TWO_PI
+    fc = fc_re + 1j * fc_im if want_fc else None
     return fc, grad_xyz, grad_b

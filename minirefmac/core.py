@@ -141,15 +141,15 @@ class RefineData:
     elem_index: np.ndarray = None    # (M,) int
     sf_table_nbytes: int = 0         # bytes actually used by the sf storage
 
-    def sf_block(self, c0, c1):
-        """Scattering factors for atoms [c0:c1], shape (N, c1-c0) float64.
+    def sf_block(self, c0, c1, reflections=slice(None)):
+        """Scattering factors for atoms [c0:c1] and an optional reflection slice.
 
         Small/medium systems slice the full (N,M) table bit-for-bit unchanged;
         large systems gather the per-element curves (numpy advanced indexing).
         """
         if self.sf_table is not None:
-            return self.sf_table[:, c0:c1]
-        return self.sf_unique[:, self.elem_index[c0:c1]]
+            return self.sf_table[reflections, c0:c1]
+        return self.sf_unique[reflections, self.elem_index[c0:c1]]
 
     @property
     def n_ref(self):
@@ -237,7 +237,9 @@ class CycleStats:
     negll_free: float = float("nan")
     geom: float = float("nan")
     rmsd_bond: float = float("nan")
-    rmsd_angle: float = float("nan")
+    rmsd_angle: float = float("nan")  # radians
+    rmsd_angle_deg: float = float("nan")
+    n_angle_outlier_4sigma: int = 0
     rmsz_bond: float = float("nan")
     w_xray: float = float("nan")
     mean_fom: float = float("nan")

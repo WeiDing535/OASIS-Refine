@@ -27,6 +27,9 @@ classifiers = [
 minirefmac = "minirefmac.cli:main"
 minirefmac-selftest = "minirefmac.selftest:main"
 
+[project.gui-scripts]
+minirefmac-gui = "minirefmac.gui:main"
+
 [tool.setuptools]
 packages = ["minirefmac", "minirefmac.data"]
 

@@ -8,6 +8,7 @@
 #   PYTHON=/path/to/venv/bin/python ./run_linux_test.sh     (or --python PATH)
 #
 # No external suite, no external dictionary CIFs and no local binaries are needed.
+# Set MINIREFMAC_TEST_OUT to an absolute path for a separate output directory.
 # Dependencies are NOT installed by this script -- see README_LINUX.md.
 set -u
 
@@ -41,7 +42,11 @@ fi
 
 MTZ="$HERE/test_data/7enm/input.mtz"
 PDB="$HERE/test_data/7enm/input.pdb"
-OUT="$HERE/linux_test_out"
+OUT="${MINIREFMAC_TEST_OUT:-$HERE/linux_test_out}"
+case "$OUT" in
+    /*) ;;
+    *) echo "MINIREFMAC_TEST_OUT must be an absolute path" >&2; exit 2 ;;
+esac
 SUMMARY="$OUT/summary.txt"
 T0=$(date +%s)
 
@@ -58,9 +63,9 @@ elapsed() { echo $(( $(date +%s) - $1 )); }
 
 # ---------------------------------------------------------------- 0
 step "0/7  interpreter and dependencies"
+mkdir -p "$OUT" || exit 1
+: > "$SUMMARY" || exit 1
 command -v "$PY" >/dev/null 2>&1 || fail "python not found: $PY (use --python PATH)"
-mkdir -p "$OUT" || fail "cannot create $OUT"
-: > "$SUMMARY"
 
 "$PY" - <<'EOF' || exit 1
 import sys
@@ -95,7 +100,6 @@ except Exception as exc:                      # pragma: no cover
 EOF
 [ -f "$MTZ" ] || fail "missing test data: $MTZ"
 [ -f "$PDB" ] || fail "missing test data: $PDB"
-[ -w "$HERE" ] || fail "$HERE is not writable (needed for linux_test_out/)"
 echo "data    : test_data/7enm (input.mtz + input.pdb)"
 record "environment + dependencies" "$(elapsed $T0)"
 
@@ -173,25 +177,33 @@ fi
 
 # ---------------------------------------------------------------- 7
 if [ "$KERNELS" = yes ]; then
-    step "7/7  kernel parity (numpy / fused / SIMD must agree)"
+    step "7/7  kernel parity (all available kernels must agree)"
     S=$(date +%s)
-    for K in numpy fused simd; do
+    KERNEL_LIST="numpy fused"
+    if "$PY" -c 'from minirefmac.simdkernel import probe; import sys; ok, why = probe(); print("SIMD:", why); sys.exit(0 if ok else 1)'; then
+        KERNEL_LIST="$KERNEL_LIST simd"
+    else
+        echo "SKIP  SIMD kernel unavailable" | tee -a "$SUMMARY"
+    fi
+    for K in $KERNEL_LIST; do
         mkdir -p "$OUT/kernels/$K"
-        "$PY" -m minirefmac --mtz "$MTZ" --pdb "$PDB" \
+        MINIREFMAC_STRICT_KERNEL=1 "$PY" -m minirefmac --mtz "$MTZ" --pdb "$PDB" \
             --out-dir "$OUT/kernels/$K" --ncyc 1 --maxiter 1 \
             --kernel "$K" > "$OUT/kernels/$K.log" 2>&1 \
             || { cat "$OUT/kernels/$K.log"; fail "kernel $K"; }
         grep -E "^RESULT" "$OUT/kernels/$K.log"
     done
-    "$PY" - "$OUT/kernels" <<'EOF' || fail "kernels disagree (see above)"
+    "$PY" - "$OUT/kernels" $KERNEL_LIST <<'EOF' || fail "kernels disagree (see above)"
 import json, os, sys
 root = sys.argv[1]
 vals = {}
-for k in ("numpy", "fused", "simd"):
+for k in sys.argv[2:]:
     p = os.path.join(root, k, "report.json")
     if not os.path.exists(p):
         sys.exit("missing %s" % p)
     r = json.load(open(p))
+    if r["kernel"] != k:
+        sys.exit("requested %s, used %s" % (k, r["kernel"]))
     vals[k] = (r["final"]["r_work"], r["final"]["r_free"], r["final"]["negll"])
 ref = vals["numpy"]
 bad = False
@@ -205,7 +217,7 @@ for k, v in vals.items():
           % (k, v[0], v[1], v[2], d_r, d_rf, d_ll, flag))
 sys.exit(1 if bad else 0)
 EOF
-    record "kernel parity (numpy/fused/simd)" "$(elapsed $S)"
+    record "kernel parity ($KERNEL_LIST)" "$(elapsed $S)"
 else
     step "7/7  kernel parity SKIPPED (add --kernels)"
 fi

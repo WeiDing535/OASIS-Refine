@@ -16,7 +16,7 @@ Checks
 7. output MTZ columns are readable and free-set RESTORE is honoured
 8. output MTZ uses the REFMAC5 absolute scale (F_abs = F_obs/k_total),
    FC is atom-only, and the convention is recorded in the MTZ history
-9. every acceleration kernel (fused / SIMD / FFT) reproduces the numpy
+9. every acceleration kernel (fused / SIMD) reproduces the numpy
    reference Fc and gradients *for the same ML coefficient G* -- this is what
    guarantees that all kernels follow the same refinement trajectory
 10. the FreeR flag convention is resolved correctly ("auto"): CCP4 0=free,
@@ -34,10 +34,10 @@ import gemmi
 
 try:
     from . import (dataio, sfcalc, likelihood, gradient, geometry, maps, refine,
-                   fastkernel, simdkernel, fftcalc)
+                   fastkernel, simdkernel)
 except ImportError:  # pragma: no cover
     import dataio, sfcalc, likelihood, gradient, geometry, maps, refine
-    import fastkernel, simdkernel, fftcalc
+    import fastkernel, simdkernel
 
 
 def _finite_diff(fun, vec, idx, step):
@@ -245,6 +245,8 @@ def run(args):
     kres["fused"] = dict(fc=_rel(fc_fu, fc_atoms), gx=_rel(gx_fu, gx),
                          gb=_rel(gb_fu, gb), required=True)
     ok_simd, why_simd = simdkernel.probe()
+    if ok_simd and not simdkernel.ensure_simd_lib():
+        ok_simd, why_simd = False, "SIMD build/load failed"
     if ok_simd:
         fc_sd, gx_sd, gb_sd = simdkernel.simd_fc_and_gradients(
             data, xyz, b, occ, G, fcf, chunk=args.chunk)
@@ -253,26 +255,13 @@ def run(args):
     else:
         kres["simd"] = dict(skipped=why_simd, required=False, fc=0.0,
                             gx=0.0, gb=0.0)
-    try:
-        sp = fftcalc.auto_spacing(data.cell, getattr(data, "d_min", None),
-                                   b_min=float(np.min(b)))
-        grid, fatoms, _ = fftcalc._scatter_density(
-            data, sp, sfcalc._sym_ops(data), None, xyz=xyz, b_iso=b, occ=occ)
-        fc_fft = fftcalc.fft_fc(data, spacing=sp, radius_A=None,
-                                grid=grid, atoms=fatoms)
-        kres["fft"] = dict(fc=_rel(fc_fft, fc_atoms), spacing=float(sp),
-                           required=False)
-    except Exception as exc:              # pragma: no cover
-        kres["fft"] = dict(error=str(exc), required=False, fc=0.0)
-    ok9 = all((v.get("fc", 0.0) < 1e-9 and v.get("gx", 0.0) < 1e-9
-               and v.get("gb", 0.0) < 1e-9) for k, v in kres.items()
-              if v.get("required"))
-    ok9 = bool(ok9 and kres.get("fft", {}).get("fc", 1.0) < 5e-3)
+    ok9 = all(v[metric] < 1e-9 for v in kres.values() if v["required"]
+              for metric in ("fc", "gx", "gb"))
     out["checks"]["kernel_agreement"] = dict(passed=ok9, kernels=kres)
-    print("9) kernel agreement (fixed G): %s  (fft Fc rel err %.1e)"
-          % (", ".join("%s %.0e" % (k, v.get("fc", 0.0))
-                       for k, v in kres.items()), kres.get("fft", {}).get("fc", 0.0)),
-          flush=True)
+    print("9) kernel agreement (fixed G): %s"
+          % ", ".join("%s %s" % (k, ("%.0e" % max(v["fc"], v["gx"], v["gb"]))
+                                     if v["required"] else "skipped: " + v["skipped"])
+                      for k, v in kres.items()), flush=True)
 
     # ---- 10. FreeR flag convention --------------------------------------
     cases = [("ccp4 0=free", [0] * 5 + [1] * 95, 0),

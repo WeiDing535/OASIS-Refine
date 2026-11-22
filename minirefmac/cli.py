@@ -66,6 +66,17 @@ def build_parser():
     g.add_argument("--keep-hydrogens", action="store_true",
                    help="keep hydrogens instead of dropping them")
 
+    g.add_argument("--all-altlocs", action="store_true",
+                   help="refine all alternate coordinates and B factors at fixed input occupancies")
+
+    g.add_argument("--refine-occupancies", action="store_true",
+                   help="optimize paired alternate occupancies on work reflections; implies --all-altlocs")
+
+    g.add_argument("--freeze-overlapping-occupancies", action="store_true",
+                   help="keep input occupancies for overlapping audited aromatic pairs")
+    g.add_argument("--occupancy-prior-sigma", type=float, default=None, metavar="SIGMA",
+                   help="optional Gaussian occupancy prior centered on stage input (0–1 units)")
+
     # ---- protocol ------------------------------------------------------
     g = p.add_argument_group("refinement protocol")
     g.add_argument("--ncyc", type=int, default=5, help="outer cycles (REFMAC NCYC)")
@@ -97,6 +108,30 @@ def build_parser():
                         "(0.05 calibrated to REFMAC-like geometry; 1.0 "
                         "over-fits the data)")
     g.add_argument("--no-auto-weight", action="store_true")
+    g.add_argument("--weight-mode", choices=["auto", "heuristic", "fixed"],
+                   default="auto",
+                   help="how w_xray is updated between cycles: 'auto' (default) "
+                        "searches it on Rfree inside a band around the cycle-0 "
+                        "gradient balance; 'heuristic' is the pre-0.3 ad-hoc "
+                        "feedback; 'fixed' keeps the gradient balance")
+    g.add_argument("--weight-step", type=float, default=1.5,
+                   help="multiplicative step of the Rfree weight search "
+                        "(default 1.5)")
+    g.add_argument("--weight-band", type=float, nargs=2, default=[0.5, 3.0],
+                   metavar=("MIN", "MAX"),
+                   help="band for the weight search, as multiples of the "
+                        "cycle-0 gradient balance (default 0.5 3.0)")
+    g.add_argument("--early-stop", default="paired", metavar="{paired|off|N}",
+                   help="early stopping: 'paired' (default) stops when the "
+                        "current model is significantly worse than the best "
+                        "one (paired Rfree test, t>=2); an integer N stops "
+                        "after N cycles without a new best; 'off' disables")
+    g.add_argument("--no-keep-best", action="store_true",
+                   help="write the LAST cycle's model instead of the best-Rfree "
+                        "model (default: write the best, which is the one you "
+                        "want when the free set is honest)")
+    g.add_argument("--restraint-cif", action="append", default=[], metavar="FILE",
+                   help="optional monomer/ligand component CIF; repeat for multiple files")
     g.add_argument("--w-bond", type=float, default=1.0)
     g.add_argument("--w-angle", type=float, default=1.0)
     g.add_argument("--w-b", type=float, default=1.0)
@@ -109,23 +144,18 @@ def build_parser():
 
     # ---- performance ---------------------------------------------------
     g = p.add_argument_group("performance")
-    g.add_argument("--kernel", choices=["auto", "numpy", "simd", "fused", "fft"],
+    g.add_argument("--kernel", choices=["auto", "numpy", "simd", "fused"],
                    default="auto",
                    help="structure-factor/gradient kernel.  'auto' (default) "
                         "uses the AVX-512 SIMD kernel when this machine has the "
                         "CPU flags and a C compiler, else numpy.  All kernels "
                         "use the same ML coefficients, so they give the same "
                         "refinement trajectory (verified by the selftest)")
+    g.add_argument("--simd-threads", type=int, choices=range(1, 65),
+                   metavar="N", default=1,
+                   help="AVX-512 atom-panel workers (1–64; default: 1)")
     g.add_argument("--chunk", type=int, default=48,
                    help="reflections per block for the direct-sum kernels")
-    g.add_argument("--fft-spacing", type=float, default=None,
-                   help="FFT grid spacing in A (default: auto = adaptive, "
-                        "0.25 A for typical protein B-factors).  Smaller = more "
-                        "accurate, slower")
-    g.add_argument("--fft-radius", type=float, default=None,
-                   help="FFT density cut-off radius in A (default: per-atom "
-                        "adaptive, 2.6 sigma of the widest Gaussian, floored at "
-                        "2.5 A and capped at 5 A)")
 
     # ---- deprecated aliases --------------------------------------------
     g = p.add_argument_group("deprecated aliases (use --kernel)")
@@ -133,8 +163,6 @@ def build_parser():
                    help="alias for --kernel fused")
     g.add_argument("--simd-kernel", action="store_true",
                    help="alias for --kernel simd")
-    g.add_argument("--fft-kernel", action="store_true",
-                   help="alias for --kernel fft")
 
     # ---- output --------------------------------------------------------
     g = p.add_argument_group("output")
@@ -177,14 +205,20 @@ def main(argv=None):
         use_monlib=not args.no_monlib,
         weight=args.weight, weight_scale=args.weight_scale,
         auto_weight=not args.no_auto_weight,
+        weight_mode=args.weight_mode, weight_step=args.weight_step,
+        weight_min_scale=args.weight_band[0], weight_max_scale=args.weight_band[1],
+        early_stop=args.early_stop, keep_best=not args.no_keep_best,
+        restraint_cifs=tuple(args.restraint_cif),
+        refine_occupancies=args.refine_occupancies,
+        freeze_overlapping_occupancies=args.freeze_overlapping_occupancies,
+        occupancy_prior_sigma=args.occupancy_prior_sigma,
         w_bond=args.w_bond, w_angle=args.w_angle, w_b=args.w_b,
         w_vdw=args.w_vdw, sym_vdw=not args.no_sym_vdw,
         max_shift_a=args.max_shift, b_min=args.bmin, b_max=args.bmax,
         chunk=args.chunk, map_scale=args.map_scale,
         kernel=args.kernel,
         fused_kernel=args.fused_kernel, simd_kernel=args.simd_kernel,
-        fft_kernel=args.fft_kernel, fft_spacing=args.fft_spacing,
-        fft_radius=args.fft_radius,
+        simd_threads=args.simd_threads,
         verbose=not args.quiet,
         out_pdb=os.path.join(args.out_dir, tag + "refined.pdb"),
         out_mtz=os.path.join(args.out_dir, tag + "refined.mtz"),
@@ -208,7 +242,7 @@ def main(argv=None):
             hla_label=args.hla, hlb_label=args.hlb,
             hlc_label=args.hlc, hld_label=args.hld,
             d_min=args.dmin, d_max=args.dmax,
-            keep_hydrogens=args.keep_hydrogens)
+            keep_hydrogens=args.keep_hydrogens, all_altlocs=args.all_altlocs or args.refine_occupancies)
     except (OSError, ValueError, RuntimeError) as exc:
         print("ERROR: cannot load input data: %s" % exc, file=sys.stderr)
         return 2
@@ -234,11 +268,21 @@ def main(argv=None):
         print("ERROR: refinement failed: %s" % exc, file=sys.stderr)
         return 3
 
+    # Report what was WRITTEN, not just the last cycle: with keep_best /
+    # early stopping the two differ, and the written model is the deliverable.
+    w = result.get("written") or {}
+    fin = result["final"]
     print("\nRESULT  R %.4f -> %.4f   Rfree %.4f -> %.4f   -LL %.1f -> %.1f   "
-          "%.1f s" % (result["initial"]["r_work"], result["final"]["r_work"],
-                      result["initial"]["r_free"], result["final"]["r_free"],
-                      result["initial"]["negll"], result["final"]["negll"],
+          "%.1f s" % (result["initial"]["r_work"], w.get("r_work", fin["r_work"]),
+                      result["initial"]["r_free"], w.get("r_free", fin["r_free"]),
+                      result["initial"]["negll"], w.get("negll", fin["negll"]),
                       result["wall_seconds"]), flush=True)
+    if w and w.get("model") == "best":
+        print("  written model = cycle %d (best Rfree); last cycle %d had "
+              "R=%.4f Rfree=%.4f%s"
+              % (w["cycle"], fin.get("cycle", -1), fin["r_work"], fin["r_free"],
+                 "  [early stop]" if result.get("early_stopped") else ""),
+              flush=True)
     print("  kernel=%s   outputs: %s, %s%s"
           % (result.get("kernel", "?"), o.out_pdb, o.out_mtz,
              "" if not o.out_json else ", " + o.out_json), flush=True)

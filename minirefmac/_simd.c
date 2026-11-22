@@ -21,7 +21,7 @@
  * polynomial).  Verified to ~1e-14 absolute error vs libm (see bench_simd).
  *
  * Interface (C linkage, ctypes):
- *   void simd_fc_grad_panel(
+ *   void simd_fc_grad_panel_v2(
  *       const double* hklT,    // [3*n_ref]  COLUMN-MAJOR: hklT[k*n_ref+n] = hkl[n,k]
  *       const double* AG_re,   // [n_ref]
  *       const double* AG_im,   // [n_ref]   AG = conj(G)*fc_atom_factor
@@ -35,6 +35,8 @@
  *       double* fc_im,         // [n_ref]  accumulate in/out
  *       double* gx,            // [nc*3]   accumulate in/out (final*=-2pi)
  *       double* gb);           // [nc]     accumulate in/out (final as-is)
+ *
+ * Pass NULL for both Fc outputs or both gradient outputs to skip that calculation.
  *
  * NOTE: hkl MUST be supplied transposed (3 x n_ref, column-major) so that each
  * Miller-index column hklT[k*n_ref+n] is contiguous and can be loaded with a
@@ -106,7 +108,7 @@ static inline void simd_sincos_pd(__m512d ang, __m512d* s_out, __m512d* c_out) {
     *c_out = cout;
 }
 
-void simd_fc_grad_panel(const double* hklT,
+void simd_fc_grad_panel_v2(const double* hklT,
                         const double* AG_re, const double* AG_im,
                         const double* R, const double* t,
                         const double* xyzc, const double* Wt,
@@ -119,6 +121,9 @@ void simd_fc_grad_panel(const double* hklT,
     const double t0=t[0],t1=t[1],t2=t[2];
     const __m512d v2pi = _mm512_set1_pd(6.283185307179586476925286766559);
     const __m512d vzero = _mm512_setzero_pd();
+
+    const int want_fc = fc_re != NULL;
+    const int want_grad = gx != NULL;
 
     for (int c = 0; c < nc; c++) {
         double x0 = xyzc[c*3+0], x1 = xyzc[c*3+1], x2 = xyzc[c*3+2];
@@ -155,45 +160,51 @@ void simd_fc_grad_panel(const double* hklT,
 
             __m512d wr  = _mm512_mask_loadu_pd(vzero, mask, Wc + n);
 
-            /* Fc += W*(cs + i*sn)  -- fc is indexed by reflection, lane=reflection */
-            __m512d fcr = _mm512_mask_loadu_pd(vzero, mask, fc_re + n);
-            __m512d fci = _mm512_mask_loadu_pd(vzero, mask, fc_im + n);
-            fcr = _mm512_fmadd_pd(wr, cs, fcr);
-            fci = _mm512_fmadd_pd(wr, sn, fci);
-            _mm512_mask_storeu_pd(fc_re + n, mask, fcr);
-            _mm512_mask_storeu_pd(fc_im + n, mask, fci);
+            if (want_fc) {
+                /* Fc += W*(cs + i*sn)  -- fc is indexed by reflection, lane=reflection */
+                __m512d fcr = _mm512_mask_loadu_pd(vzero, mask, fc_re + n);
+                __m512d fci = _mm512_mask_loadu_pd(vzero, mask, fc_im + n);
+                fcr = _mm512_fmadd_pd(wr, cs, fcr);
+                fci = _mm512_fmadd_pd(wr, sn, fci);
+                _mm512_mask_storeu_pd(fc_re + n, mask, fcr);
+                _mm512_mask_storeu_pd(fc_im + n, mask, fci);
+            }
 
-            /* AE = (AG_re + i*AG_im) * W * (cs + i*sn) */
-            __m512d agr = _mm512_mask_loadu_pd(vzero, mask, AG_re + n);
-            __m512d agi = _mm512_mask_loadu_pd(vzero, mask, AG_im + n);
-            __m512d wr_agr = _mm512_mul_pd(wr, agr);
-            __m512d wr_agi = _mm512_mul_pd(wr, agi);
-            __m512d aer = _mm512_fmsub_pd(wr_agr, cs, _mm512_mul_pd(wr_agi, sn));
-            __m512d aei = _mm512_fmadd_pd(wr_agr, sn, _mm512_mul_pd(wr_agi, cs));
+            if (want_grad) {
+                /* AE = (AG_re + i*AG_im) * W * (cs + i*sn) */
+                __m512d agr = _mm512_mask_loadu_pd(vzero, mask, AG_re + n);
+                __m512d agi = _mm512_mask_loadu_pd(vzero, mask, AG_im + n);
+                __m512d wr_agr = _mm512_mul_pd(wr, agr);
+                __m512d wr_agi = _mm512_mul_pd(wr, agi);
+                __m512d aer = _mm512_fmsub_pd(wr_agr, cs, _mm512_mul_pd(wr_agi, sn));
+                __m512d aei = _mm512_fmadd_pd(wr_agr, sn, _mm512_mul_pd(wr_agi, cs));
 
-            /* gb[c] += -stol2 * Re[AE]  (sum over reflections) */
-            __m512d st2 = _mm512_mask_loadu_pd(vzero, mask, stol2 + n);
-            __m512d neg_aer_st2 = _mm512_mul_pd(_mm512_sub_pd(vzero, st2), aer);
-            gb[c] += _mm512_mask_reduce_add_pd(mask, neg_aer_st2);
+                /* gb[c] += -stol2 * Re[AE]  (sum over reflections) */
+                __m512d st2 = _mm512_mask_loadu_pd(vzero, mask, stol2 + n);
+                __m512d neg_aer_st2 = _mm512_mul_pd(_mm512_sub_pd(vzero, st2), aer);
+                gb[c] += _mm512_mask_reduce_add_pd(mask, neg_aer_st2);
 
-            /* gx[c*3+k] += (R^T h)[k] * Im[AE]  (accumulate over reflections) */
-            __m512d hR0 = _mm512_fmadd_pd(h0, _mm512_set1_pd(R0),
-                                _mm512_fmadd_pd(h1, _mm512_set1_pd(R3),
-                                    _mm512_mul_pd(h2, _mm512_set1_pd(R6))));
-            __m512d hR1 = _mm512_fmadd_pd(h0, _mm512_set1_pd(R1),
-                                _mm512_fmadd_pd(h1, _mm512_set1_pd(R4),
-                                    _mm512_mul_pd(h2, _mm512_set1_pd(R7))));
-            __m512d hR2 = _mm512_fmadd_pd(h0, _mm512_set1_pd(R2),
-                                _mm512_fmadd_pd(h1, _mm512_set1_pd(R5),
-                                    _mm512_mul_pd(h2, _mm512_set1_pd(R8))));
+                /* gx[c*3+k] += (R^T h)[k] * Im[AE]  (accumulate over reflections) */
+                __m512d hR0 = _mm512_fmadd_pd(h0, _mm512_set1_pd(R0),
+                                    _mm512_fmadd_pd(h1, _mm512_set1_pd(R3),
+                                        _mm512_mul_pd(h2, _mm512_set1_pd(R6))));
+                __m512d hR1 = _mm512_fmadd_pd(h0, _mm512_set1_pd(R1),
+                                    _mm512_fmadd_pd(h1, _mm512_set1_pd(R4),
+                                        _mm512_mul_pd(h2, _mm512_set1_pd(R7))));
+                __m512d hR2 = _mm512_fmadd_pd(h0, _mm512_set1_pd(R2),
+                                    _mm512_fmadd_pd(h1, _mm512_set1_pd(R5),
+                                        _mm512_mul_pd(h2, _mm512_set1_pd(R8))));
 
-            gx0 = _mm512_fmadd_pd(hR0, aei, gx0);
-            gx1 = _mm512_fmadd_pd(hR1, aei, gx1);
-            gx2 = _mm512_fmadd_pd(hR2, aei, gx2);
+                gx0 = _mm512_fmadd_pd(hR0, aei, gx0);
+                gx1 = _mm512_fmadd_pd(hR1, aei, gx1);
+                gx2 = _mm512_fmadd_pd(hR2, aei, gx2);
+            }
         }
-        /* fold the reflection-lane accumulators into the (nc,3) gradient array */
-        gx[c*3+0] += _mm512_mask_reduce_add_pd(0xFF, gx0);
-        gx[c*3+1] += _mm512_mask_reduce_add_pd(0xFF, gx1);
-        gx[c*3+2] += _mm512_mask_reduce_add_pd(0xFF, gx2);
+        if (want_grad) {
+            /* fold the reflection-lane accumulators into the (nc,3) gradient array */
+            gx[c*3+0] += _mm512_mask_reduce_add_pd(0xFF, gx0);
+            gx[c*3+1] += _mm512_mask_reduce_add_pd(0xFF, gx1);
+            gx[c*3+2] += _mm512_mask_reduce_add_pd(0xFF, gx2);
+        }
     }
 }

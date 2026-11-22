@@ -161,7 +161,7 @@ def _resolve_element(symbol):
     return el
 
 
-def _iter_atoms(st, keep_hydrogens):
+def _iter_atoms(st, keep_hydrogens, all_altlocs=False):
     """Yield (global_index, atom, residue, chain, keep) in a fixed order.
 
     The SAME order/filter is used by load_data and by coordinate write-back so
@@ -172,7 +172,7 @@ def _iter_atoms(st, keep_hydrogens):
         for chain in model:
             for res in chain:
                 for atom in res:
-                    keep = atom.altloc in _ALTLOC_OK
+                    keep = all_altlocs or atom.altloc in _ALTLOC_OK
                     if atom.element.name in _HYDROGEN and not keep_hydrogens:
                         keep = False
                     yield g, atom, res, chain, keep
@@ -251,7 +251,7 @@ def make_sf_table(data):
 
 
 # ---- coordinate write-back ---------------------------------------------
-def _apply_xyz_to_structure(data, st, xyz, b_iso=None):
+def _apply_xyz_to_structure(data, st, xyz, b_iso=None, occ=None):
     """Write fractional xyz (and optional B) into a gemmi Structure copy."""
     xyz = np.asarray(xyz, dtype=np.float64)
     sel = getattr(data, "_atom_sel", None)
@@ -270,15 +270,17 @@ def _apply_xyz_to_structure(data, st, xyz, b_iso=None):
                              float(xyz[j, 2])))
         if b_iso is not None and j < len(b_iso):
             atom.b_iso = float(b_iso[j])
+        if occ is not None:
+            atom.occ = float(occ[j])
 
 
-def write_refined_pdb(data, xyz, b_iso, path):
+def write_refined_pdb(data, xyz, b_iso, path, occ=None):
     """Write a refined model to a PDB file, leaving data.st untouched."""
     try:
         st_out = data.st.clone()
     except Exception:
         st_out = gemmi.read_structure(data.pdb_path)
-    _apply_xyz_to_structure(data, st_out, xyz, b_iso)
+    _apply_xyz_to_structure(data, st_out, xyz, b_iso, occ)
     # clone()/fresh read keeps CRYST1 and the space group
     st_out.write_pdb(path)
 
@@ -287,7 +289,7 @@ def write_refined_pdb(data, xyz, b_iso, path):
 def load_data(mtz_path, pdb_path, fp_label=None, sigfp_label=None,
               free_label=None, free_value="auto", phib_label=None, fom_label=None,
               hla_label=None, hlb_label=None, hlc_label=None, hld_label=None,
-              d_min=0.0, d_max=0.0, keep_hydrogens=False):
+              d_min=0.0, d_max=0.0, keep_hydrogens=False, all_altlocs=False):
     """Read an MTZ + PDB/mmCIF and assemble a RefineData instance.
 
     ``free_value`` is the FreeR_flag value that marks the EXCLUDED (test) set.
@@ -296,6 +298,16 @@ def load_data(mtz_path, pdb_path, fp_label=None, sigfp_label=None,
     """
     mtz = gemmi.read_mtz_file(mtz_path)
     st = gemmi.read_structure(pdb_path)
+    if all_altlocs:
+        if len(st) != 1:
+            raise ValueError("all-altloc refinement requires one coordinate model")
+        residue_names = {}
+        for chain in st[0]:
+            for residue in chain:
+                key = (chain.name, str(residue.seqid))
+                if residue_names.setdefault(key, residue.name) != residue.name:
+                    raise ValueError("all-altloc refinement does not yet support mixed residue "
+                                     "identities at %s %s" % key)
     cell = mtz.cell
     sg = mtz.spacegroup
 
@@ -455,8 +467,16 @@ def load_data(mtz_path, pdb_path, fp_label=None, sigfp_label=None,
     elements, atom_names, altlocs = [], [], []
     res_names, res_seq, chain_ids, is_h = [], [], [], []
     sel = []
-    for g, atom, res, chain, keep in _iter_atoms(st, keep_hydrogens):
+    n_skipped_altloc = 0
+    residue_rows = []
+    last_residue = None
+    residue_index = -1
+    for g, atom, res, chain, keep in _iter_atoms(st, keep_hydrogens, all_altlocs):
+        if res is not last_residue:
+            residue_index += 1
+            last_residue = res
         if not keep:
+            n_skipped_altloc += int(atom.altloc not in _ALTLOC_OK)
             continue
         frac = cell.fractionalize(atom.pos)
         xyz_l.append([frac.x, frac.y, frac.z])
@@ -470,6 +490,7 @@ def load_data(mtz_path, pdb_path, fp_label=None, sigfp_label=None,
         chain_ids.append(chain.name)
         is_h.append(atom.element.name in _HYDROGEN)
         sel.append(g)
+        residue_rows.append(residue_index)
 
     data = RefineData(
         cell=cell, sg=sg,
@@ -501,7 +522,9 @@ def load_data(mtz_path, pdb_path, fp_label=None, sigfp_label=None,
             n_free=int(np.sum(is_free & observed)),
             n_work=int(np.sum(observed & ~is_free)),
             free_fraction=round(frac_free, 6),
-            n_altloc_atoms=int(sum(1 for a in altlocs if a not in _ALTLOC_OK)),
+            n_altloc_atoms=n_skipped_altloc,
+            all_altlocs=bool(all_altlocs),
+            n_selected_altloc_atoms=sum(a not in ("", " ", "\x00") for a in altlocs),
             n_hydrogen_atoms=int(np.sum(is_h)) if len(is_h) else 0,
             n_atoms=len(xyz_l),
         ),
@@ -512,6 +535,9 @@ def load_data(mtz_path, pdb_path, fp_label=None, sigfp_label=None,
     )
     # private bookkeeping: which gemmi atom each data.xyz row came from
     data._atom_sel = np.asarray(sel, dtype=np.int64)
+    data._all_altlocs = bool(all_altlocs)
+    if all_altlocs:
+        data._residue_rows = residue_rows
     data._keep_hydrogens = bool(keep_hydrogens)
 
     make_sf_table(data)

@@ -54,7 +54,8 @@ mkdir -p "$DEST"
 echo "staging $NAME ..."
 tar -cf - \
     --exclude=.venv --exclude=__pycache__ --exclude='*.pyc' --exclude='*.so' \
-    --exclude=linux_test_out --exclude=dist --exclude=.git --exclude='*.egg-info' \
+    --exclude=linux_test_out --exclude=oasis_gui_runs --exclude=dist --exclude=.git \
+    --exclude='*.egg-info' \
     --exclude=build --exclude='.pytest_cache' --exclude='.ruff_cache' \
     . 2>/dev/null | tar -xf - -C "$DEST"
 

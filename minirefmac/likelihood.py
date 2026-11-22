@@ -63,6 +63,8 @@ MLHL EXPERIMENTAL PHASE PRIOR (use_phase_prior=True)
               gradient reduces to the standard centric dll_dab there.
     Reflections WITHOUT a usable prior fall back to the no-prior formula.
 """
+import math
+
 import numpy as np
 from scipy.special import i0e, i1e
 from scipy.optimize import minimize
@@ -473,3 +475,60 @@ def r_factors(data, fc_total, scale):
         return float(np.sum(diff[m]) / den)
 
     return R(data.work), R(data.test), R(obs)
+
+
+def rfree_stats(data, fc_total, scale, ref_fc=None, ref_scale=None):
+    """Rfree with its standard error, plus a paired test against a reference model.
+
+    Rfree is a ratio of sums, ``R = sum|Fo - k|Fc|| / sum Fo`` over the free
+    set, so the numerator ``A = sum|d_i|`` carries all the sampling noise while
+    the denominator ``B = sum Fo`` is fixed by the data.  Hence
+
+        SE(R)      = sd(|d_i|) * sqrt(n) / B
+        dR (A vs B) = sum(|d_i^A| - |d_i^B|) / B      (paired, same reflections)
+        SE(dR)     = sd(|d_i^A| - |d_i^B|) * sqrt(n) / B
+
+    The paired form is far more sensitive than comparing two independent
+    estimates, because two models of the same crystal share Fo and have highly
+    correlated |d_i|.  We report ``t = dR/SE(dR)`` and call a difference real
+    when ``|t| >= 2``.
+
+    Note: the mean-of-ratios ``mean(|d_i|/Fo)`` is NOT Rfree -- it is dominated
+    by the weakest reflections and reads much higher (0.50 vs 0.40 on 7enm).
+
+    Returns a dict; keys are present only when they can be computed.
+    """
+    obs = np.asarray(data.observed, dtype=bool)
+    test = np.asarray(data.test, dtype=bool) & obs
+    n = int(np.sum(test))
+    out = {"n_free": n}
+    if n < 2:
+        return out
+    fo = np.asarray(data.fo, dtype=np.float64)
+    good = test & (fo > 0.0)
+    n = int(np.sum(good))
+    if n < 2:
+        return out
+    fo_f = fo[good]
+    B = float(np.sum(fo_f))
+    k = np.asarray(scale.k_total(data), dtype=np.float64)
+    d1 = np.abs(fo - k * np.abs(np.asarray(fc_total, dtype=np.complex128)))[good]
+    A = float(np.sum(d1))
+    out.update(n_free=n, r_free=A / B if B > 0 else float("nan"),
+               se=(float(np.std(d1, ddof=1)) * math.sqrt(n) / B
+                   if B > 0 else float("nan")),
+               sum_fo=B)
+    if ref_fc is not None and ref_scale is not None:
+        k2 = np.asarray(ref_scale.k_total(data), dtype=np.float64)
+        d2 = np.abs(fo - k2 * np.abs(np.asarray(ref_fc, dtype=np.complex128)))[good]
+        diff = d1 - d2
+        mean_d = float(np.sum(diff)) / B if B > 0 else float("nan")
+        se_d = (float(np.std(diff, ddof=1)) * math.sqrt(n) / B
+                if B > 0 else float("nan"))
+        out.update(delta_vs_ref=mean_d, se_delta=se_d,
+                   t=(mean_d / se_d if se_d and np.isfinite(se_d) and se_d > 0
+                      else float("nan")),
+                   ref_r_free=float(np.sum(d2)) / B if B > 0 else float("nan"))
+        # identical models give mean_d = se_d = 0: not a difference
+        out["significant"] = bool(se_d > 0.0 and abs(mean_d) >= 2.0 * se_d)
+    return out

@@ -5,7 +5,7 @@
 #   PYTHON=/path/to/venv/bin/python ./run.sh --help
 #
 # Only gemmi / numpy / scipy from PyPI are needed.  The restraint dictionary
-# is bundled in minirefmac/data/ -- no external files are read at runtime.
+# is bundled in minirefmac/data/. Optional component CIFs can be given explicitly.
 #
 # Interpreter precedence: $PYTHON > local .venv/bin/python > python3.
 set -e
@@ -17,5 +17,10 @@ elif [ -x "$HERE/.venv/bin/python" ]; then
 else
     PY=python3
 fi
-cd "$HERE"
+PYTHONPATH="$HERE${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH
+if [ "${1:-}" = "--gui" ]; then
+    shift
+    exec "$PY" -m minirefmac.gui "$@"
+fi
 exec "$PY" -m minirefmac "$@"

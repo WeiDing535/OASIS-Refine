@@ -7,7 +7,8 @@ peptide-link definition into ``data/monlib_bundle.zip``.  At RUNTIME this
 module reads that zip and rebuilds lightweight objects with exactly the
 attribute surface ``geometry.Restraints`` expects (``b.id1.atom``,
 ``a.value``, ``pl.ids``, ``ch.sign``, ``tt.period`` ...).  No external files
-and no ``gemmi.cif`` parsing are involved.
+are needed for the default bundled path. Explicit component CIFs can
+be supplied by the caller.
 
 Only the residues actually present in the model are decoded.  A single
 module-level ``Monlib`` instance keeps the zip handle open and caches decoded
@@ -18,9 +19,12 @@ provenance notice ship next to the bundle in ``data/``.
 """
 
 import json
+import math
 import os
 import zipfile
 from types import SimpleNamespace as _NS
+
+import gemmi
 
 BUNDLE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "data", "monlib_bundle.zip")
@@ -143,3 +147,38 @@ _BUNDLE = Monlib()
 def bundled():
     """The process-wide bundled dictionary reader."""
     return _BUNDLE
+
+
+
+def load_component_cifs(paths):
+    """Read externally supplied intramonomer restraints by component ID."""
+    components = {}
+    for path in paths:
+        try:
+            doc = gemmi.cif.read_file(str(path))
+            parsed = []
+            for block in doc:
+                if not block.find_loop("_chem_comp_atom.atom_id"):
+                    continue
+                comp = gemmi.make_chemcomp_from_block(block)
+                cif_id = block.find_value("_chem_comp.id")
+                name = (gemmi.cif.as_string(cif_id) if cif_id else comp.name).upper()
+                if not name or not comp.atoms:
+                    raise ValueError("component ID or atoms missing")
+                rt = comp.rt
+                if any(not math.isfinite(b.value) or b.value <= 0
+                       or not math.isfinite(b.esd) for b in rt.bonds):
+                    raise ValueError("invalid bond target or uncertainty for %s" % name)
+                if any(not math.isfinite(a.value) or not math.isfinite(a.esd)
+                       for a in rt.angles):
+                    raise ValueError("invalid angle target or uncertainty for %s" % name)
+                parsed.append((name, rt))
+            if not parsed:
+                raise ValueError("no chemical component with an atom loop")
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise ValueError("invalid component CIF %s: %s" % (path, exc)) from exc
+        for name, restraints in parsed:
+            if name in components:
+                raise ValueError("duplicate component %s in restraint CIFs" % name)
+            components[name] = restraints
+    return components

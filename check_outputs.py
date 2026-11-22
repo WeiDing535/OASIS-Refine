@@ -31,7 +31,10 @@ import sys
 import gemmi
 import numpy as np
 
-REQUIRED_MTZ = ["F", "SIGF", "FC", "PHIC", "FC_ALL", "PHIC_ALL",
+from minirefmac import dataio, maps
+from minirefmac.core import ScaleParams
+
+REQUIRED_MTZ = ["FC", "PHIC", "FC_ALL", "PHIC_ALL",
                 "FWT", "PHWT", "DELFWT", "PHDELWT", "FOM"]
 
 
@@ -47,11 +50,15 @@ def check_mtz(path, data, report, msgs):
         return _fail(msgs, "missing %s" % path)
     m = gemmi.read_mtz_file(path)
     labels = [c.label for c in m.columns]
-    missing = [c for c in REQUIRED_MTZ if c not in labels]
+    refl = report.get("reflection_columns", {})
+    fp = dataio._pick(data, dataio._FP_LABELS, "F", refl.get("f"))
+    sig = dataio._pick(data, dataio._SIG_LABELS, "Q", refl.get("sigma"))
+    required = [fp.label, sig.label, *REQUIRED_MTZ]
+    missing = [c for c in required if c not in labels]
     if missing:
         ok = _fail(msgs, "refined.mtz lacks columns: %s" % ", ".join(missing))
     else:
-        print("  ok    refined.mtz has all %d expected columns" % len(REQUIRED_MTZ))
+        print("  ok    refined.mtz has all %d expected columns" % len(required))
     sg_out, sg_in = str(m.spacegroup.hm), str(data.spacegroup.hm)
     if sg_out.replace(" ", "") != sg_in.replace(" ", ""):
         ok = _fail(msgs, "space group %s != input %s" % (sg_out, sg_in))
@@ -88,13 +95,39 @@ def check_mtz(path, data, report, msgs):
         if not np.all(np.isfinite(ph)) or np.any(np.abs(ph) > 360.0 + 1e-6):
             ok = _fail(msgs, "%s phases out of range" % name)
 
-    # R recomputed from the file vs report.json
-    if "F" in labels and "FC_ALL" in labels:
-        f = np.asarray(arr[:, idx["F"]], dtype=np.float64)
+    # Reconstruct the working set from the original MTZ. Rows outside the
+    # retained resolution window may have zero map coefficients on output.
+    if fp.label in labels and "FC_ALL" in labels:
+        if not np.array_equal(arr[:, :3], data.array[:, :3]):
+            return _fail(msgs, "output HKL rows differ from input")
+        f = np.asarray(arr[:, idx[fp.label]], dtype=np.float64)
         fc = np.asarray(arr[:, idx["FC_ALL"]], dtype=np.float64)
-        sel = np.isfinite(f) & np.isfinite(fc) & (f > 0)
+        sel = np.isfinite(fp.array) & (fp.array > 0) & np.isfinite(sig.array)
+        scale_values = report.get("final_scale_params")
+        if scale_values:
+            scale = ScaleParams(**scale_values)
+            k, rows = maps.all_rows_k_total(data, scale)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                resolution = 0.5 / np.sqrt(rows.stol2)
+            sel &= np.isfinite(resolution)
+            sel &= resolution >= float(report.get("d_min", 0.0)) - 1e-9
+            sel &= resolution <= float(report.get("d_max", np.inf)) + 1e-9
+            free = report.get("free", {})
+            if free.get("mode") != "absent" and free.get("label"):
+                col = data.column_with_label(free["label"])
+                if col is None:
+                    return _fail(msgs, "report FreeR column missing from input")
+                sel &= np.rint(col.array) != int(free["value"])
+            if free.get("n_work") is not None and int(sel.sum()) != int(free["n_work"]):
+                return _fail(msgs, "reconstructed work reflection count differs from report")
+            if report.get("map_scale", "absolute") == "absolute":
+                f *= np.where(k > 1e-12, k, 1.0)
+                fc *= k
+        if not np.any(sel) or np.sum(f[sel]) <= 0 or not np.isfinite(f[sel]).all():
+            return _fail(msgs, "working amplitudes in the output are missing or invalid")
         r_file = float(np.sum(np.abs(f[sel] - fc[sel])) / np.sum(f[sel]))
-        r_rep = float(report.get("final", {}).get("r_work", float("nan")))
+        r_rep = float((report.get("written") or report.get("final", {}))
+                      .get("r_work", float("nan")))
         if not math.isfinite(r_rep):
             ok = _fail(msgs, "report.json has no final R")
         elif abs(r_file - r_rep) > 0.01:

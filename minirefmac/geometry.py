@@ -32,10 +32,8 @@ IMPLEMENTATION NOTES
   same attribute surface (bonds, angles, torsions, chirs, planes) from
   compact per-residue JSON, so no external files and no CIF parsing are
   needed.
-* Angles use the classic PROLSQ 1-3 DISTANCE form: the dictionary angle
-  (theta0, sigma_theta) plus the two 1-2 target distances give a target 1-3
-  distance d13 by the cosine rule, with sigma_13 propagated from sigma_theta.
-  This avoids the singularity of a direct angle gradient.
+* Dictionary angles use explicit three-atom angles in radians. Unknown
+  residues retain the initial-distance fallback.
 * Planarity is a TRUE least-squares plane:  f = w lambda_min(C) with
   C = sum u_i u_i^T and u_i = X_i - mean(X).  lambda_min is rotation invariant
   (so the group may rotate freely) and the envelope theorem gives the exact,
@@ -62,10 +60,9 @@ IMPLEMENTATION NOTES
 * Intra-chain peptide C--N links come from the ``link_TRANS`` definition,
   also bundled (``LINK_TRANS.json`` inside the zip): the C--N bond, the three
   non-hydrogen cross-peptide bond angles (CA-C-N / O-C-N / C-N-CA), the
-  trans omega torsion and the peptide-unit plane.  Cross-peptide angles are
-  added in the same 1-3-distance PROLSQ form as the intra-residue angles,
-  with sigma propagated by d13 = cosine-rule(d12, d23, theta0).  They account
-  for the ~3 x n_peptide angle-restraint gap against REFMAC5.
+  trans omega torsion and the peptide-unit plane.
+* Explicit same-ASU disulfides and unambiguous close cysteine SG pairs are
+  restrained as bonds and excluded from non-bonded repulsion.
 * Non-bonded VDW repulsion is a one-sided harmonic on ASU-internal pairs AND
   symmetry mates / neighbouring unit cells:  f = w sum max(0, d_min-d)^2 with
   d_min = r_vdw(i)+r_vdw(j)-0.3 A and sigma = 0.2 A (REFMAC's Av(Sigma)).
@@ -78,7 +75,10 @@ IMPLEMENTATION NOTES
 """
 
 import os
-from itertools import product
+import warnings
+from collections import Counter, defaultdict
+from itertools import combinations, product
+import gemmi
 import numpy as np
 from scipy.spatial import cKDTree
 
@@ -223,13 +223,56 @@ def _accumulate(out, idx, val):
         out[:, k] += np.bincount(idx, weights=val[:, k], minlength=m)
 
 
+def _explicit_disulfides(data, sulfur):
+    """Resolve PDB/mmCIF disulfide declarations to the selected atom rows."""
+    st = getattr(data, "st", None)
+    connections = [] if st is None else [
+        c for c in st.connections if c.type == gemmi.ConnectionType.Disulf]
+    if not connections:
+        return [], set()
+
+    selected = dict(zip(getattr(data, "_atom_sel", range(data.n_atoms)),
+                        range(data.n_atoms)))
+    atoms = defaultdict(list)
+    sulfur = set(sulfur)
+    original_atoms = ((chain, residue, atom) for model in st for chain in model
+                      for residue in chain for atom in residue)
+    for index, (chain, residue, atom) in enumerate(original_atoms):
+        row = selected.get(index)
+        if row in sulfur:
+            key = (chain.name, str(residue.seqid), residue.name, atom.name)
+            atoms[key].append((atom.altloc, row))
+
+    occupied = set()
+    pairs = set()
+    for connection in connections:
+        rows = []
+        for address in (connection.partner1, connection.partner2):
+            key = (address.chain_name, str(address.res_id.seqid),
+                   address.res_id.name, address.atom_name)
+            matches = [row for alt, row in atoms[key]
+                       if address.altloc in ("", " ", "\x00") or alt == address.altloc]
+            occupied.update(matches)
+            if len(matches) == 1:
+                rows.append(matches[0])
+        if len(set(rows)) != 2 or connection.asu == gemmi.Asu.Different:
+            warnings.warn("Disulfide %s is unresolved or crosses symmetry; "
+                          "no direct bond restraint added" % connection.name)
+            continue
+        pairs.add(tuple(sorted(rows)))
+    degree = Counter(row for pair in pairs for row in pair)
+    if any(n > 1 for n in degree.values()):
+        warnings.warn("Conflicting explicit disulfides have been skipped")
+    return [pair for pair in sorted(pairs) if all(degree[row] == 1 for row in pair)], occupied
+
+
 class Restraints:
     """Stereochemical restraint target and its analytic gradients."""
 
     def __init__(self, data, w_bond=1.0, w_angle=1.0,
                  w_b=1.0, w_torsion=1.0, w_plane=1.0, w_chir=1.0,
                  use_monlib=True, w_vdw=1.0, sym_vdw=True,
-                 vdw_cutoff=_VDW_CUTOFF, peptide_plane=True):
+                 vdw_cutoff=_VDW_CUTOFF, peptide_plane=True, restraint_cifs=()):
         # Restraint parameters always come from the dictionary bundled in
         # ``minirefmac/data/monlib_bundle.zip``.
         self.monlib_path = monlib.BUNDLE_PATH
@@ -264,6 +307,9 @@ class Restraints:
         # ---- dictionary (only residue kinds actually present) -----------
         kinds = sorted(set(res_names))
         lib = self._load_library(kinds)
+        external = monlib.load_component_cifs(restraint_cifs)
+        used_external = sorted(set(external).intersection(kinds))
+        lib.update({name: external[name] for name in used_external})
         linkdef = _load_link_defs()
         n_kinds_hit = len(lib)
 
@@ -286,10 +332,11 @@ class Restraints:
 
         # ---- residue blocks (consecutive atoms with same chain/seq/name) --
         blocks = []
+        residue_rows = getattr(data, "_residue_rows", seq)
         start = 0
         for i in range(1, n_atoms + 1):
             if (i == n_atoms or chains[i] != chains[start]
-                    or seq[i] != seq[start]
+                    or residue_rows[i] != residue_rows[start]
                     or res_names[i] != res_names[start]):
                 blocks.append((start, i))
                 start = i
@@ -301,14 +348,34 @@ class Restraints:
         plane_groups = []
         t1, t2, t3, t4, tval, tesd, tper = [], [], [], [], [], [], []
         dist_pairs = set()
-        sig13_pool = []
-        n_res_hit = 0
+        angles = []
+        residues_hit = set()
         n_bond_from_dict = 0
+
+        angle_keys, torsion_keys, plane_keys, chiral_keys = set(), set(), set(), set()
+
+        def add_angle(ids, target, sigma):
+            key = (*ids, float(target), max(float(sigma), 0.1))
+            if key in angle_keys:
+                return False
+            angle_keys.add(key)
+            angles.append(key)
+            return True
+
+        def add_plane(ids, weight):
+            key = (tuple(ids), weight)
+            if key in plane_keys:
+                return False
+            plane_keys.add(key)
+            plane_groups.append((ids, weight))
+            return True
 
         def add_torsion(a, b, c, d, v_deg, e_deg, per):
             """Dictionary torsion, or the peptide omega dihedral."""
-            if len({a, b, c, d}) < 4:
+            key = (a, b, c, d, v_deg, e_deg, per)
+            if len({a, b, c, d}) < 4 or key in torsion_keys:
                 return
+            torsion_keys.add(key)
             t1.append(a); t2.append(b); t3.append(c); t4.append(d)
             tval.append(np.deg2rad(float(v_deg)))
             tesd.append(np.deg2rad(max(float(e_deg), 1.0)))
@@ -336,15 +403,41 @@ class Restraints:
                 bw.append(w_b / (sb * sb))
             return True
 
-        # ---- per-residue dictionary restraints --------------------------
+        # Shared atoms belong to every map; each alternate label gets its
+        # own map. Restraints containing only shared atoms are added once.
         block_maps = []
-        torsion_adj_cache = {}   # resname -> intra-residue covalent adjacency
-        for (s, e) in blocks:
-            rn = res_names[s]
-            name2idx = {}
+        self._altloc_conflicts = set()
+        all_altlocs = getattr(data, "_all_altlocs", False)
+        labels = ([alt if alt not in ("", " ", "\x00") else "" for alt in data.altloc]
+                  if all_altlocs else [""] * n_atoms)
+        peptide_maps = []
+        peptide_names = {atom for entry in linkdef["angles"] for atom in entry[1:6:2]}
+        peptide_names.update(("N", "CA", "C", "O"))
+        for s, e in blocks:
+            shared = {}
+            alternatives = defaultdict(dict)
             for i in range(s, e):
-                name2idx.setdefault(names[i], i)
-            block_maps.append(name2idx)
+                alt = labels[i]
+                if not alt:
+                    shared.setdefault(names[i], i)
+                else:
+                    alternatives[alt].setdefault(names[i], i)
+            block_maps.append({alt: shared | mapping
+                               for alt, mapping in alternatives.items()} or {"": shared})
+            backbone = {name: i for name, i in shared.items() if name in peptide_names}
+            backbone_alts = {alt: {name: i for name, i in mapping.items() if name in peptide_names}
+                             for alt, mapping in alternatives.items()}
+            peptide_maps.append({(alt if mapping else ""): backbone | mapping
+                                 for alt, mapping in backbone_alts.items()} or {"": backbone})
+            for left, right in combinations(alternatives.values(), 2):
+                self._altloc_conflicts.update(tuple(sorted(pair))
+                                              for pair in product(left.values(), right.values()))
+
+        torsion_adj_cache = {}
+        conformers = ((k, *blocks[k], mapping) for k, maps in enumerate(block_maps)
+                      for mapping in maps.values())
+        for block_index, s, e, name2idx in conformers:
+            rn = res_names[s]
             rt = lib.get(rn)
             n_dict_bonds = 0
 
@@ -360,40 +453,15 @@ class Restraints:
                         sg = max(float(b.esd), _SIGMA_FLOOR)
                     except (TypeError, ValueError):
                         continue
+                    n_dict_bonds += 1
                     if add_dist(i, j, v, sg, w_bond / (sg * sg),
                                 _BOND, True):
-                        n_dict_bonds += 1
                         n_bond_from_dict += 1
 
-                # -- angles -> 1-3 distance --
                 for a in rt.angles:
-                    i = name2idx.get(a.id1.atom)
-                    k = name2idx.get(a.id3.atom)
-                    if i is None or k is None:
-                        continue            # 1..3 atom must exist in model
-                    n2 = a.id2.atom
-                    d12 = bond_d0.get((rn, frozenset((a.id1.atom, n2))))
-                    d23 = bond_d0.get((rn, frozenset((n2, a.id3.atom))))
-                    j2 = name2idx.get(n2)
-                    if d12 is None and j2 is not None:
-                        d12 = float(np.linalg.norm(x0[i] - x0[j2]))
-                    if d23 is None and j2 is not None:
-                        d23 = float(np.linalg.norm(x0[j2] - x0[k]))
-                    if d12 is None or d23 is None or d12 <= 0 or d23 <= 0:
-                        continue
-                    try:
-                        theta = np.deg2rad(float(a.value))
-                        stheta = np.deg2rad(max(float(a.esd), 0.1))
-                    except (TypeError, ValueError):
-                        continue
-                    cos_t = np.cos(theta)
-                    d13 = np.sqrt(max(d12 * d12 + d23 * d23
-                                      - 2.0 * d12 * d23 * cos_t, 1e-8))
-                    sig13 = d12 * d23 * np.sin(theta) * stheta / d13
-                    sig13 = max(float(sig13), 0.02)
-                    sig13_pool.append(sig13)
-                    add_dist(i, k, d13, sig13,
-                             w_angle / (sig13 * sig13), _ANGLE, True)
+                    ids = [name2idx.get(atom.atom) for atom in (a.id1, a.id2, a.id3)]
+                    if None not in ids and len(set(ids)) == 3:
+                        add_angle(ids, a.value, a.esd)
 
                 # -- planarity: TRUE least-squares plane --------------------
                 # Each group contributes  f = w * lambda_min(C)  where
@@ -413,7 +481,7 @@ class Restraints:
                         esd = max(float(pl.esd), 0.02)
                     except (TypeError, ValueError):
                         esd = 0.02
-                    plane_groups.append((ids, w_plane / (esd * esd)))
+                    add_plane(ids, w_plane / (esd * esd))
 
                 # -- chirality: true oriented-volume analytic gradient ----
                 for ch in rt.chirs:
@@ -424,8 +492,10 @@ class Restraints:
                     if any(v is None for v in (a, b, c, ctr)):
                         continue
                     sgn = self._chir_sign(ch.sign)
-                    if sgn == 0:
+                    key = (a, b, c, ctr, sgn)
+                    if sgn == 0 or key in chiral_keys:
                         continue                # 'Both': no restraint
+                    chiral_keys.add(key)
                     v1 = x0[a] - x0[ctr]
                     v2 = x0[b] - x0[ctr]
                     v3 = x0[c] - x0[ctr]
@@ -445,7 +515,7 @@ class Restraints:
                 #   * skip torsions closed by a covalent ring (PRO chi1/chi2).
                 for tt in rt.torsions:
                     label = str(tt.label)
-                    if not label.startswith(_TORSION_LABEL_PREFIX):
+                    if rn not in external and not label.startswith(_TORSION_LABEL_PREFIX):
                         continue
                     quad = tuple(getattr(tt, k).atom
                                  for k in ("id1", "id2", "id3", "id4"))
@@ -473,7 +543,7 @@ class Restraints:
                             adj.setdefault(u, set()).add(v)
                             adj.setdefault(v, set()).add(u)
                         torsion_adj_cache[rn] = adj
-                    if _ring_torsion(torsion_adj_cache[rn], quad):
+                    if rn not in external and _ring_torsion(torsion_adj_cache[rn], quad):
                         continue
                     add_torsion(*ids, val, esd, per)
 
@@ -482,22 +552,22 @@ class Restraints:
             # non-standard / H-only dictionary), hold the initial 1-2 and
             # 1-3 distances with the dictionary median sigma.
             if n_dict_bonds == 0:
-                med13 = (float(np.median(sig13_pool))
-                         if sig13_pool else 0.04)
+                med13 = 0.04
                 w13 = w_angle / (med13 * med13)
-                for p in range(s, e):
-                    for q in range(p + 1, e):
-                        if (p, q) in dist_pairs:
-                            continue
-                        dv = float(np.linalg.norm(x0[p] - x0[q]))
-                        if 0.9 < dv < 2.0:
-                            add_dist(p, q, dv, med_sigma,
-                                     w_bond / (med_sigma * med_sigma),
-                                     _BOND, False)
-                        elif 2.0 <= dv < 3.3:
-                            add_dist(p, q, dv, med13, w13, _ANGLE, False)
+                residue_atoms = sorted(set(name2idx.values())) if all_altlocs else range(s, e)
+                for p, q in combinations(residue_atoms, 2):
+                    if (p, q) in dist_pairs:
+                        continue
+                    dv = float(np.linalg.norm(x0[p] - x0[q]))
+                    if 0.9 < dv < 2.0:
+                        add_dist(p, q, dv, med_sigma,
+                                 w_bond / (med_sigma * med_sigma),
+                                 _BOND, False)
+                    elif 2.0 <= dv < 3.3:
+                        add_dist(p, q, dv, med13, w13, _ANGLE, False)
             else:
-                n_res_hit += 1
+                residues_hit.add(block_index)
+        n_res_hit = len(residues_hit)
 
         # ---- peptide links: C-N bond, 3 cross-link angles, omega, plane --
         cn_d0, cn_sigma = linkdef["bond"]
@@ -510,76 +580,71 @@ class Restraints:
             s1, e1 = blocks[k + 1]
             if chains[s0] != chains[s1]:
                 continue
-            m0 = block_maps[k]
-            m1 = block_maps[k + 1]
-            ci = m0.get("C")
-            ni = m1.get("N")
-            if ci is None or ni is None:
-                continue
-            dv = float(np.linalg.norm(x0[ci] - x0[ni]))
-            if dv > 1.8:                       # chain break, not a peptide bond
-                continue
-            lookup = {"1": m0, "2": m1}
-            rlookup = {"1": res_names[s0], "2": res_names[s1]}
-
-            def link_bond_len(c1, a1, c2, a2, i1, i2):
-                """1-2 target length for one edge of a cross-peptide angle."""
-                if c1 != c2:
-                    return cn_d0                 # the C_i -- N_{i+1} link bond
-                d = bond_d0.get((rlookup[c1], frozenset((a1, a2))))
-                if d is None and i1 is not None and i2 is not None:
-                    d = float(np.linalg.norm(x0[i1] - x0[i2]))
-                return d
-
-            add_dist(ci, ni, cn_d0, cn_sigma,
-                     w_bond / (cn_sigma ** 2), _BOND, False)
-            n_peptide += 1
-
-            # link_TRANS angle entries, e.g. CA(1)-C(1)-N(2) = 115.917 deg.
-            # Convert each to a PROLSQ 1-3 distance with cosine rule, exactly
-            # as the intra-residue dictionary angles are handled.
-            for (c1, a1, c2, a2, c3, a3, th_deg, es_deg) in linkdef["angles"]:
-                i1 = lookup[c1].get(a1)
-                i2 = lookup[c2].get(a2)
-                i3 = lookup[c3].get(a3)
-                if any(v is None for v in (i1, i2, i3)):
-                    continue                    # e.g. the C-N-H entry
-                d12 = link_bond_len(c1, a1, c2, a2, i1, i2)
-                d23 = link_bond_len(c2, a2, c3, a3, i2, i3)
-                if d12 is None or d23 is None or d12 <= 0 or d23 <= 0:
+            for (alt0, m0), (alt1, m1) in product(peptide_maps[k].items(),
+                                                    peptide_maps[k + 1].items()):
+                if alt0 and alt1 and alt0 != alt1:
                     continue
-                th = np.deg2rad(float(th_deg))
-                sth = np.deg2rad(max(float(es_deg), 0.1))
-                d13 = np.sqrt(max(d12 * d12 + d23 * d23
-                                  - 2.0 * d12 * d23 * np.cos(th), 1e-8))
-                sig13 = max(float(d12 * d23 * np.sin(th) * sth / d13), 0.02)
-                if add_dist(i1, i3, d13, sig13,
-                            w_angle / (sig13 * sig13), _ANGLE, False):
-                    n_cross_angle += 1
+                ci = m0.get("C")
+                ni = m1.get("N")
+                if ci is None or ni is None:
+                    continue
+                dv = float(np.linalg.norm(x0[ci] - x0[ni]))
+                if dv > 1.8:                       # chain break, not a peptide bond
+                    continue
+                lookup = {"1": m0, "2": m1}
 
-            # trans-peptide omega: CA_i - C_i - N_{i+1} - CA_{i+1} -> 180 deg,
-            # period 1, esd 5 deg (REFMAC's "period 1" torsion class: exactly
-            # one restraint per peptide link).
-            ca0 = m0.get("CA")
-            ca1 = m1.get("CA")
-            if ca0 is not None and ca1 is not None:
-                add_torsion(ca0, ci, ni, ca1, om_val, om_esd, om_per)
+                n_peptide += add_dist(ci, ni, cn_d0, cn_sigma,
+                                      w_bond / (cn_sigma ** 2), _BOND, False)
 
-            # peptide-unit plane (CA_i, C_i, O_i, N_{i+1}), sigma 0.020 A.
-            # REFMAC lists one such planar group per peptide link; without it
-            # our planar-group count was ~1/3 of REFMAC's.
-            if self._peptide_plane:
-                ids = []
-                for comp, atom in linkdef["plane"]:
-                    idx = lookup.get(comp, {}).get(atom)
-                    if idx is None:
-                        ids = []
-                        break
-                    ids.append(idx)
-                if len(set(ids)) >= 4:
-                    esd = max(float(linkdef["plane_esd"]), 0.005)
-                    plane_groups.append((ids, w_plane / (esd * esd)))
-                    n_link_plane += 1
+                for c1, a1, c2, a2, c3, a3, th_deg, es_deg in linkdef["angles"]:
+                    ids = [lookup[c].get(a) for c, a in ((c1, a1), (c2, a2), (c3, a3))]
+                    if None not in ids and len(set(ids)) == 3:
+                        n_cross_angle += add_angle(ids, th_deg, es_deg)
+
+                # trans-peptide omega: CA_i - C_i - N_{i+1} - CA_{i+1} -> 180 deg,
+                # period 1, esd 5 deg (REFMAC's "period 1" torsion class: exactly
+                # one restraint per peptide link).
+                ca0 = m0.get("CA")
+                ca1 = m1.get("CA")
+                if ca0 is not None and ca1 is not None:
+                    add_torsion(ca0, ci, ni, ca1, om_val, om_esd, om_per)
+
+                # peptide-unit plane (CA_i, C_i, O_i, N_{i+1}), sigma 0.020 A.
+                # REFMAC lists one such planar group per peptide link; without it
+                # our planar-group count was ~1/3 of REFMAC's.
+                if self._peptide_plane:
+                    ids = []
+                    for comp, atom in linkdef["plane"]:
+                        idx = lookup.get(comp, {}).get(atom)
+                        if idx is None:
+                            ids = []
+                            break
+                        ids.append(idx)
+                    if len(set(ids)) >= 4:
+                        esd = max(float(linkdef["plane_esd"]), 0.005)
+                        n_link_plane += add_plane(ids, w_plane / (esd * esd))
+
+        sulfur = [i for i, name in enumerate(names) if name == "SG" and res_names[i] == "CYS"]
+        explicit, occupied = _explicit_disulfides(data, sulfur)
+        sulfur = [i for i in sulfur if i not in occupied]
+        inferred = []
+        if sulfur:
+            candidates = sorted((i, j) for i, j in cKDTree(x0[sulfur]).query_pairs(2.5)
+                                if (sulfur[i], sulfur[j]) not in self._altloc_conflicts
+                                and (not labels[sulfur[i]] or not labels[sulfur[j]]
+                                     or labels[sulfur[i]] == labels[sulfur[j]]))
+            degree = Counter(row for pair in candidates for row in pair)
+            inferred = [(sulfur[i], sulfur[j]) for i, j in candidates
+                        if degree[i] == degree[j] == 1]
+        disulfide_sigma = 0.02
+        n_disulfide = sum(add_dist(i, j, 2.031, disulfide_sigma,
+                                   w_bond / disulfide_sigma ** 2, _BOND, False)
+                          for i, j in explicit + inferred)
+
+        angle_table = np.asarray(angles, dtype=float).reshape(-1, 5)
+        self._ai, self._aj, self._ak = angle_table[:, :3].astype(np.int64).T
+        self._a0, self._asig = np.deg2rad(angle_table[:, 3:]).T
+        self._aw = w_angle / self._asig ** 2
 
         # ---- freeze into arrays -----------------------------------------
         self._di = np.asarray(di, dtype=np.int64)
@@ -641,13 +706,17 @@ class Restraints:
             n_kinds=len(kinds),
             n_kinds_hit=n_kinds_hit,
             n_bond=n_bond,
-            n_angle=int(self._mask_angle.sum()),
+            n_angle=self.n_angles,
+            n_angle_distance=int(self._mask_angle.sum()),
             n_plane=int(self._pl_mask.sum()),   # atoms in planar groups
             n_plane_groups=int(self._pl_w.size),
             n_torsion=int(self._tw.size),
             n_chir=len(ci1),
             n_bfac=len(bi),
             n_peptide=n_peptide,
+            n_disulfide=n_disulfide,
+            n_disulfide_explicit=len(explicit),
+            external_components=used_external,
             n_cross_angle=n_cross_angle,
             n_link_plane=n_link_plane,
             n_bond_from_dict=n_bond_from_dict,
@@ -657,7 +726,7 @@ class Restraints:
             hit_rate_bond=(n_bond_from_dict / n_bond if n_bond else 0.0),
             n_vdw=int(self._vi.size),
             n_vdw_sym=int(getattr(self, "_n_vdw_sym", 0)),
-            n_restraints=(len(di) + len(ci1) + len(bi) + int(self._vi.size)
+            n_restraints=(len(di) + self.n_angles + len(ci1) + len(bi) + int(self._vi.size)
                           + int(self._pl_mask.sum()) + int(self._tw.size)),
         )
 
@@ -711,7 +780,7 @@ class Restraints:
         # (1) ASU-internal pairs (both atoms in the base cell)
         tree_au = cKDTree(x0)
         for i, j in sorted(tree_au.query_pairs(cut)):
-            if (i, j) in topo:
+            if (i, j) in topo or (i, j) in self._altloc_conflicts:
                 continue
             vi.append(i); vj.append(j); vB.append(B_id); vc.append(zero)
         n_au = len(vi)
@@ -784,8 +853,7 @@ class Restraints:
     def _load_library(self, kinds):
         """Restraints for the residue kinds present in the model.
 
-        Reads the dictionary bundled in ``minirefmac/data``; no external
-        files and no CIF parsing are involved.
+        Reads the default dictionary bundled in ``minirefmac/data``.
         """
         if not self.use_monlib:
             return {}
@@ -798,7 +866,7 @@ class Restraints:
 
     @property
     def n_angles(self):
-        return int(self._mask_angle.sum())
+        return self._a0.size
 
     # ------------------------------------------------------------------
     def calc(self, xyz, b_iso):
@@ -819,6 +887,23 @@ class Restraints:
         coef = (2.0 * self._dw * delta / d)[:, None] * rij
         _accumulate(gcart, self._di, coef)
         _accumulate(gcart, self._dj, -coef)
+
+        u = X[self._ai] - X[self._aj]
+        v = X[self._ak] - X[self._aj]
+        un = np.maximum(np.linalg.norm(u, axis=1), 1e-9)
+        vn = np.maximum(np.linalg.norm(v, axis=1), 1e-9)
+        u /= un[:, None]
+        v /= vn[:, None]
+        dot = np.einsum("ij,ij->i", u, v)
+        sine = np.linalg.norm(np.cross(u, v), axis=1)
+        angle_delta = np.arctan2(sine, dot) - self._a0
+        f += float(np.sum(self._aw * angle_delta ** 2))
+        dc = 2 * self._aw * angle_delta / np.maximum(sine, 1e-8)
+        gi = (dot[:, None] * u - v) * (dc / un)[:, None]
+        gk = (dot[:, None] * v - u) * (dc / vn)[:, None]
+        _accumulate(gcart, self._ai, gi)
+        _accumulate(gcart, self._ak, gk)
+        _accumulate(gcart, self._aj, -gi - gk)
 
         # ---- B-factor restraints (on the bonds) -------------------------
         dB = b_iso[self._bi] - b_iso[self._bj]
@@ -927,11 +1012,11 @@ class Restraints:
         # ---- Cartesian -> FRACTIONAL gradient (chain rule) -------------
         grad_xyz = gcart @ self._orth + grad_extra
 
-        stats = self._stats(d, delta, dB, vdw_pen, plane_z, torsion_dev)
+        stats = self._stats(delta, angle_delta, dB, vdw_pen, plane_z, torsion_dev)
         return float(f), grad_xyz, gb, stats
 
     # ------------------------------------------------------------------
-    def _stats(self, d, delta, dB, vdw_pen=None, plane_z=None,
+    def _stats(self, delta, angle_delta, dB, vdw_pen=None, plane_z=None,
                torsion_dev=None):
         kb = self._mask_bond
         ka = self._mask_angle
@@ -943,20 +1028,23 @@ class Restraints:
         db = delta[kb]
         da = delta[ka]
         rmsd_bond = rms(db * db)
-        rmsd_angle = rms(da * da)
+        rmsd_angle = rms(angle_delta ** 2)
         rmsz_bond = rms(db * db / (sig[kb] ** 2))
-        rmsz_angle = rms(da * da / (sig[ka] ** 2))
+        rmsz_angle = rms((angle_delta / self._asig) ** 2)
         rmsd_b = rms(dB * dB)
         max_bond_dev = float(np.max(np.abs(db))) if len(db) else 0.0
 
         stats = dict(
             rmsd_bond=rmsd_bond,
-            rmsd_angle=rmsd_angle,
+            rmsd_angle=rmsd_angle,  # radians
+            rmsd_angle_deg=float(np.rad2deg(rmsd_angle)),
+            rmsd_angle_distance_A=rms(da ** 2),
+            n_angle_outlier_4sigma=int(np.count_nonzero(abs(angle_delta) > 4 * self._asig)),
             rmsz_bond=rmsz_bond,
             rmsz_angle=rmsz_angle,
             rmsd_b=rmsd_b,
             n_bond=int(kb.sum()),
-            n_angle=int(ka.sum()),
+            n_angle=self.n_angles,
             max_bond_dev=max_bond_dev,
         )
         # extra diagnostics (do not interfere with the required keys)
@@ -967,7 +1055,7 @@ class Restraints:
             n_plane=int(self._pl_mask.sum()),
             n_chir=int(self._ci1.size),
             n_bfac=int(self._bi.size),
-            n_restraints=int(self._di.size + self._ci1.size + self._bi.size
+            n_restraints=int(self._di.size + self.n_angles + self._ci1.size + self._bi.size
                              + self._vi.size + self._pl_mask.sum()
                              + self._tw.size),
             dict_hit_rate=self.info["hit_rate_res"],

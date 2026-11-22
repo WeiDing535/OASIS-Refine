@@ -95,7 +95,7 @@ def calc_fc(data, xyz, b_iso, occ=None, chunk=64):
 
 
 # ---- bulk-solvent mask --------------------------------------------------
-def _write_mask_coords(data, st, xyz):
+def _write_mask_coords(data, st, xyz, occ=None):
     """Put fractional xyz into a gemmi Structure copy (for the masker)."""
     xyz = np.asarray(xyz, dtype=np.float64)
     sel = getattr(data, "_atom_sel", None)
@@ -130,10 +130,12 @@ def _write_mask_coords(data, st, xyz):
                             gemmi.Fractional(float(xyz[jj, 0]),
                                              float(xyz[jj, 1]),
                                              float(xyz[jj, 2])))
+                        if occ is not None:
+                            atom.occ = float(occ[jj])
                     g += 1
 
 
-def calc_fmask(data, xyz=None):
+def calc_fmask(data, xyz=None, occ=None):
     """Complex bulk-solvent mask structure factor, shape (N,) complex128.
 
     Returns an all-zero array (with a warning) if the FFT path is unavailable.
@@ -145,7 +147,7 @@ def calc_fmask(data, xyz=None):
         except Exception:
             st = gemmi.read_structure(data.pdb_path)
         eff_xyz = data.xyz if xyz is None else xyz
-        _write_mask_coords(data, st, eff_xyz)
+        _write_mask_coords(data, st, eff_xyz, occ)
 
         dpos = data.d[np.isfinite(data.d) & (data.d > 0.0)]
         dmin = float(np.min(dpos)) if dpos.size else 2.0

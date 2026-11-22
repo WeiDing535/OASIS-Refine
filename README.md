@@ -1,98 +1,109 @@
 # minirefmac · oasis-refine
 
-从零实现的**最大似然（ML）大分子晶体学精修引擎**，接口与行为对齐 CCP4 `refmac5`，
-但完全自包含：不需要 CCP4、不需要 Phenix、不需要任何外部单体字典或预编译二进制。
-唯一的运行时依赖是 `gemmi` / `numpy` / `scipy`。
+### Desktop interface
 
-- 版本：0.2.0（Python ≥ 3.9；已在 Linux + Python 3.12 上完整验证）
-- 单体库：`minirefmac/data/monlib_bundle.zip`（35639 个残基，47.8 MB，LGPL-3.0）
-- 测试数据：`test_data/7enm/`（P 21 21 21，1.70–34.69 Å，11057 反射 / 670 原子）
-- Linux 验收与完整说明书：[`README_LINUX.md`](README_LINUX.md)
+Run `./run.sh --gui` from a graphical desktop, or launch `minirefmac-gui` after installing with pip. Your Python installation must provide Tkinter.
+
+Select an MTZ file, a PDB or mmCIF model, an output folder, and an optional job name. The **Weights and reflections** tab lists compatible MTZ labels for F, SIGF, and FreeR. Leave the selections at **(Auto)** to use automatic detection.
+
+The **Progress** tab plots Rwork, Rfree, bond-angle RMSD, and bond-length RMSD from cycle 0 as refinement runs. The **Run log** tab shows engine messages. The buttons below the tabs open the output folder, PDB, MTZ, and JSON report.
+
+Each run creates a separate folder with its parameters and log. Open **Job history** to review a previous run or fill the form with its saved parameters. The history lists runs in the selected output folder. Use **Browse folder...** to find jobs saved elsewhere.
+
+By default, refinement fits the work set and saves the final cycle. To refine occupancies only in a final stage, run **All conformers · Fixed occupancy** first, then load the resulting PDB with the same original MTZ and select **All conformers · Refine occupancy**.
+
+OASIS-Refine is a self-contained maximum-likelihood (ML) macromolecular crystallographic refinement engine with a CCP4 REFMAC-style interface and outputs. Its runtime dependencies are `gemmi`, `numpy`, and `scipy`. The distribution includes the monomer dictionary and compiles the optional SIMD kernel on demand.
+
+- Version 0.2.0 requires Python ≥ 3.9 and was validated on Linux with Python 3.12.
+- `minirefmac/data/monlib_bundle.zip` contains 35,639 monomer definitions (47.8 MB, LGPL-3.0).
+- `test_data/7enm/` contains a P 21 21 21 dataset spanning 1.70–34.69 Å, with 11,057 reflections and a 670-atom model.
+- See the [Linux installation and validation guide](README_LINUX.md).
 
 ---
 
-## 快速开始
+## Quick start
 
 ```bash
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
-# 一键验收（环境 → 完整性 → 约束 → 单元测试 → 数值自检 → 短精修 → 输出校验）
-./run_linux_test.sh                 # 约 2 分钟
-./run_linux_test.sh --kernels       # 额外验证三种加速内核结果一致
+# Validate the environment, installation, restraints, numerical checks and refinement outputs
+./run_linux_test.sh                 # About 2 minutes
+./run_linux_test.sh --kernels       # Also compare all available compute kernels
 
-# 正式精修
+# Run refinement
 ./run.sh --mtz input.mtz --pdb input.pdb --out-dir out --ncyc 5 --maxiter 10
 ```
 
-输出：`out/refined.pdb`、`out/refined.mtz`（F/SIGF/FC/PHIC/FC_ALL/FWT/PHWT/DELFWT/
-PHDELWT/FOM，绝对刻度）、`out/report.json`、`out/refine.log`。
+The run writes `out/refined.pdb`, `out/refined.mtz` on the absolute scale
+(F/SIGF/FC/PHIC/FC_ALL/FWT/PHWT/DELFWT/PHDELWT/FOM), `out/report.json`, and `out/refine.log`.
 
 ---
 
-## 引擎做了什么
+## Refinement engine
 
-| 环节 | 实现 |
+| Component | Implementation |
 |---|---|
-| 目标函数 | 最大似然（Pannu & Read 1996）：`-LL = Σ [ \|Fo - k·D·\|Fc\|\|² / (2σ²) + ln σ ]`，按分辨率分箱估计 D、S（σ_A 型） |
-| 相角信息 | 可选 MLHL：`PHIB/FOM` 或 Hendrickson–Lattman `HLA..HLD`，`--phase-prior` 打开 |
-| 刻度 | 整体 k、整体 B、各向异性 B（无迹张量）、体溶剂 k_sol/B_sol（mask 或 Babinet） |
-| 体溶剂 | 分子表面 mask → 溶剂贡献，`FC_ALL = FC·(1 - k_sol·exp(-B_sol s²))` |
-| 几何约束 | 键长/键角/平面/手性/扭转（来自随包单体字典）+ 对称展开的 VDW 排斥 |
-| 优化器 | L-BFGS（`scipy`），坐标 + 各向同性 B 同时优化，带最大位移限制 |
-| 权重 | 自动：按 X-ray 与几何梯度范数比平衡（`--weight-scale`，默认 0.05），逐周期更新 |
-| 结构因子 | 直接求和（numpy / numpy 融合 / AVX-512 C）或 FFT（`--kernel fft`），四者共享同一套 ML 系数 |
-| 输出 | REFMAC 风格的 MTZ 列与 `report.json`（逐周期 R/Rfree/-LL/FOM/rmsd/权重） |
+| Objective | Maximum likelihood (Pannu & Read 1996). `-LL = Σ [ \|Fo - k·D·\|Fc\|\|² / (2σ²) + ln σ ]`. Estimates σ_A-type D and S by resolution bin. |
+| Phase information | `--phase-prior` enables MLHL with `PHIB/FOM` or Hendrickson–Lattman `HLA..HLD` coefficients. |
+| Scaling | Overall k, overall B, a traceless anisotropic B tensor, and bulk solvent k_sol/B_sol (mask or Babinet). |
+| Bulk solvent | Molecular surface mask and solvent contribution `FC_ALL = FC·(1 - k_sol·exp(-B_sol s²))`. |
+| Geometry restraints | Bundled monomer restraints for bonds, angles, planes, chirality, and torsions, plus symmetry-expanded van der Waals repulsion. |
+| Optimizer | SciPy L-BFGS jointly refines coordinates and isotropic B factors with a maximum displacement limit. |
+| Weighting | Balances X-ray and geometry gradient norms each cycle. The default `--weight-scale` is 0.05. |
+| Structure factors | Direct summation via NumPy, fused NumPy, or AVX-512 C using shared ML coefficients. |
+| Outputs | REFMAC-style MTZ columns and per-cycle R, Rfree, −LL, FOM, RMSD, and weights in `report.json`. |
 
-### 三种加速内核，结果必须一致
+### Compute kernels
 
-`--kernel auto`（默认）在本机支持 AVX-512F/DQ/VL 且有 C 编译器时用 `simd`，
-否则用 `numpy`。**所有内核在同一个 ML 系数 G 下计算 Fc 与梯度**，
-因此精修轨迹相同（`--kernels` 会实测验证：R/Rfree 差 < 1e-6，实测 2.5e-11）。
+The default `--kernel auto` selects `simd` when AVX-512F/DQ/VL and a C compiler are available. It falls back to `numpy`.
+All kernels use the same ML coefficient G to calculate Fc and its gradient.
+The `--kernels` test checks that R and Rfree differ by less than 1e-6. The measured difference was 2.5e-11.
 
-| 内核 | 7enm 单周期（1 cycle × 1 iter） | 说明 |
+| Kernel | 7enm (1 cycle × 1 iteration) | Notes |
 |---|---|---|
-| `numpy` | 18.6 s | 参考实现，永远可用 |
-| `fused` | 18.4 s | numpy 内融合相位计算，无编译器时略省时间 |
-| `simd` | 5.0 s | AVX-512 C 内核，首次运行自动用 clang/gcc 编译 `_simd.so` |
-| `fft` | 44 s | FFT 结构因子，Fc 误差 ~0.1%，只在反射数极大时才有速度优势 |
+| `numpy` | 16.6 s | Reference implementation, always available. |
+| `fused` | 16.8 s | Fused phase calculations in NumPy, available without a compiler. |
+| `simd` | 4.8 s | AVX-512 C kernel. The first run builds `_simd.so` with Clang or GCC. |
+
+> Version 0.3.0 removed `fftcalc.py` because the FFT path traded accuracy and memory for little speed benefit.
+> The implementation is available in Git history at commit `e8d0ab9`.
 
 ---
 
-## 目录
+## Project layout
 
 ```
-run.sh                  精修入口（POSIX sh）
-check_install.py        部署完整性自检（依赖 / 包路径 / 字典 / 许可证）
-check_outputs.py        精修产物自检（MTZ 列 / PDB 有限性 / R 复算 / report 一致性）
-run_linux_test.sh       一键 Linux 验收（7 阶段）
-pack_release.sh         打包含正确目录布局 + 重生成 MANIFEST + 解包复验
-MANIFEST.sha256         全量校验和
+run.sh                  POSIX shell launcher
+check_install.py        Checks dependencies, package paths, dictionary and license
+check_outputs.py        Checks MTZ columns, finite PDB values, R factors and report consistency
+run_linux_test.sh       Seven-stage Linux validation
+pack_release.sh         Preserves layout, regenerates the manifest and verifies extraction
+MANIFEST.sha256         File checksums
 requirements.txt        gemmi / numpy / scipy
-pyproject.toml          可选：pip install . 后可用 minirefmac / minirefmac-selftest 命令
-tests/                  单元测试（stdlib unittest，17 项，约 7 s）
-test_data/7enm/         随包测试输入
-minirefmac/             引擎源码
-  data/monlib_bundle.zip  随包单体字典（运行时只从这里读）
-  _simd.c                 AVX-512 内核源码（按需编译）
-  tools/build_monlib_bundle.py  构建期脚本，重建字典时才用
-README_LINUX.md         Linux 验收说明书（中文，含故障排查）
-CHANGELOG.md            版本变更
-LINUX_TEST_REPORT.md    macOS→Linux 交付验收报告
+pyproject.toml          Package metadata and CLI, self-test and GUI entry points
+tests/                  Standard-library unit tests
+test_data/7enm/         Bundled test inputs
+minirefmac/             Engine source code
+  data/monlib_bundle.zip  Bundled monomer dictionary
+  _simd.c                 AVX-512 source compiled on demand
+  tools/build_monlib_bundle.py  Rebuilds the dictionary
+README_LINUX.md         Linux setup, validation and troubleshooting
+CHANGELOG.md            Release history
+LINUX_TEST_REPORT.md    macOS-to-Linux validation report
 ```
 
 ---
 
-## 已知限制
+## Known limitations
 
-1. **不做水分子自动加建/删除**，也不做 TLS 精修；输入模型里有什么就精修什么。
-2. **B 因子只做各向同性**（含整体各向异性刻度），不做逐原子各向异性 B。
-3. **不输出自由 R 的交叉验证曲线**，`best_rfree` 只记录历史最低点。
-4. `--kernel fft` 的 Fc 有约 0.1% 的网格误差（R 偏高 ~0.0005），仅建议在超大反射集上使用。
-5. 单体字典覆盖标准氨基酸/核酸/常见配体；未知残基回退 jelly-body 约束（`--no-monlib` 可整体回退）。
+1. Refinement uses the waters in the input model. Automatic water placement and removal and TLS refinement are unavailable.
+2. Per-atom B-factor refinement is isotropic. Overall anisotropic scaling is supported.
+3. `best_rfree` records the lowest Rfree observed. The engine does not plot a free-R cross-validation curve.
+4. The bundled dictionary covers standard amino acids, nucleic acids, and common ligands. Unknown residues use jelly-body restraints. Use `--no-monlib` to apply that fallback throughout.
 
 ---
 
-## 许可
+## License
 
-代码为作者自有；`minirefmac/data/monlib_bundle.zip` 是 CCP4 单体字典的派生数据，
-按 LGPL-3.0 随包再分发，全文见 `minirefmac/data/LICENSE-CCP4-MONOMERS.txt`。
+The source code belongs to its author. The bundled `minirefmac/data/monlib_bundle.zip` derives from the CCP4 monomer dictionary and is redistributed under LGPL-3.0.
+See `minirefmac/data/LICENSE-CCP4-MONOMERS.txt` for the full license.

@@ -1,31 +1,31 @@
-# oasis-refine · Linux 实测与修订报告
+# OASIS-Refine Linux Validation Report
 
-测试机：Ubuntu 26.04 / x86_64 / 96 核 / 123 GB RAM / AVX-512F+DQ+VL
-解释器：Python 3.12.15（uv 建 venv）+ gemmi 0.7.5 / numpy 2.5.5 / scipy 1.18.1
-报告日期：2026-11-21（第一轮 11-20 验收，第二轮同日修订后复测）
-
----
-
-## 0. 一句话结论
-
-**代码在 Linux 上完全跑通**，第一轮 4 阶段验收全绿；第二轮把验收中暴露的
-**会静默给错结果的缺陷**修掉、把测试从「看日志」变成「一键判据」，
-复测 7 阶段全绿（含三内核一致性），耗时 126 s。
-
-**原交付目录原样跑不通**——不是代码问题，是打包时目录结构被拍平了（第 1 节）。
-第二轮新增的 `pack_release.sh` 专门防止这件事再发生。
+Test host — Ubuntu 26.04, x86_64, 96 cores, 123 GB RAM, AVX-512F+DQ+VL
+Environment — Python 3.12.15 in a uv virtual environment with gemmi 0.7.5, NumPy 2.5.5, and SciPy 1.18.1
+Report date — 2026-11-21. Initial validation and retesting after revisions took place on November 20.
 
 ---
 
-## 1. 第一轮：原样运行失败的原因
+## 0. Summary
 
-原目录 `/Large_pool/Workbuddy/OASIS-Refine/` 里所有文件都在顶层：
+The reconstructed deployment passed all four original Linux checks. The second round fixed silent
+correctness problems and replaced manual log inspection with automated pass criteria.
+All seven stages and the optional comparison across three kernels passed in 126 s.
+
+The original delivery failed because packaging flattened the directory tree (see Section 1).
+The second round added `pack_release.sh` to preserve that tree.
+
+---
+
+## 1. First round and diagnosis
+
+The original `/Large_pool/Workbuddy/OASIS-Refine/` directory stored every file at the top level.
 
 ```
 ./cli.py  ./core.py  ./dataio.py ... ./monlib_bundle.zip  ./input.mtz  ./input.pdb  ./__init__.py
 ```
 
-实测两条入口都直接失败：
+Both entry points failed immediately.
 
 ```
 $ python3 check_install.py
@@ -35,73 +35,73 @@ $ ./run_linux_test.sh
 FAILED: missing test data: .../OASIS-Refine/test_data/7enm/input.mtz
 ```
 
-原因：`minirefmac/`、`minirefmac/data/`、`minirefmac/tools/`、`test_data/7enm/`
-四层目录结构丢失；其中两个同名文件 `minirefmac/__init__.py` 与
-`minirefmac/data/__init__.py` 冲突，只剩下了 data 的那个
-（顶层 `__init__.py` 的 sha256 = `639a0aa9…`，对应 MANIFEST 里的
-`minirefmac/data/__init__.py`），**`minirefmac/__init__.py`（`480fe6a8…`）整个丢失**。
-这是 `zip -j` / Finder「压缩」一类操作的典型结果。
+Flattening removed the directory structure for `minirefmac/`, `minirefmac/data/`, `minirefmac/tools/`,
+and `test_data/7enm/`. The two files named `__init__.py` collided, leaving only the copy
+from the data directory. The top-level `__init__.py` checksum `639a0aa9…` matched the manifest entry
+for `minirefmac/data/__init__.py`. The original `minirefmac/__init__.py`
+(checksum `480fe6a8…`) was missing.
+Operations such as `zip -j` can produce this flattened layout.
 
-用 MANIFEST 校验可精确定位：
+The manifest identified the rebuilt file as the only checksum mismatch.
 
 ```
 $ sha256sum -c MANIFEST.sha256
-minirefmac/__init__.py: FAILED          ← 唯一一项，就是丢失后重建的那个
-28 / 29 项 OK
+minirefmac/__init__.py: FAILED          # Rebuilt file
+28 / 29 entries OK
 ```
 
-> 重建的 `minirefmac/__init__.py` 只有 docstring + `__version__`。第一轮时版本串在
-> `refine.py` 里硬编码，所以不影响功能；第二轮已把版本集中到
-> `minirefmac.__version__`（现为 0.2.0），由 `report.json` 与 MTZ history 引用。
+> The rebuilt `minirefmac/__init__.py` contained a docstring and `__version__`. In the first round,
+> refinement used the version hardcoded in `refine.py`. The second round centralized it in
+> `minirefmac.__version__` (0.2.0), which is used in `report.json` and MTZ history.
 
 ---
 
-## 2. 可运行部署与第二轮修订
+## 2. Restored deployment and second-round revisions
 
-按 MANIFEST 的路径还原成正确的树，放在
-`/Large_pool/Workbuddy/OASIS-Refine-linux/`（原目录未改动）。第二轮在此基础上做了
-**功能修订 + 工程化**，全部记录在 `CHANGELOG.md`，要点：
+The tree was reconstructed from the manifest under
+`/Large_pool/Workbuddy/OASIS-Refine-linux/`, leaving the original directory intact.
+`CHANGELOG.md` documents the revisions.
 
-| 类别 | 修订 |
+| Category | Revisions |
 |---|---|
-| 会静默出错 | FreeR 标志判定（`--free-value auto`）、四内核共用同一 G、FFT 网格过粗（Fc 误差 3.5% → 0.11%）、`FC/PHIC` 改为原子贡献 |
-| 接口 | `--kernel {auto,numpy,fused,simd,fft}`（旧布尔开关保留为别名）、`--version`、`python -m minirefmac`、错误码分级 |
-| 测试 | 新增 17 项单元测试、自检 8 → 10 项、新增 `check_outputs.py` 产物校验、`run_linux_test.sh` 4 → 7 阶段 |
-| 打包 | 新增 `pack_release.sh`：正确布局 + 重生成 MANIFEST + 解包复验 |
+| Correctness | Automatic FreeR flag detection, shared G across four kernels, finer FFT grid (Fc error 3.5% → 0.11%), atomic `FC/PHIC` contributions |
+| Interface | `--kernel {auto,numpy,fused,simd}` with legacy aliases, `--version`, `python -m minirefmac`, separate error codes |
+| Tests | 17 new unit tests, self-test expanded from 8 to 10 checks, new `check_outputs.py`, Linux test expanded from 4 to 7 stages |
+| Packaging | `pack_release.sh` preserves the layout, regenerates the manifest, and verifies archive extraction |
 
-复现命令：
+Reproduce the validation with the following commands.
 
 ```bash
 cd /Large_pool/Workbuddy/OASIS-Refine-linux
-./run_linux_test.sh --kernels      # 全量 7 阶段 + 内核一致性，126 s
-./run_linux_test.sh --checks-only  # 跳过端到端精修，70 s
+./run_linux_test.sh --kernels      # All seven stages plus kernel agreement, 126 s
+./run_linux_test.sh --checks-only  # Skip end-to-end refinement, 70 s
 ```
 
 ---
 
-## 3. 第二轮一键验收结果（7 阶段）
+## 3. Second-round automated validation
 
-| 阶段 | 判据 | 本机实测 | 结论 |
+| Stage | Criterion | Observed result | Outcome |
 |---|---|---|---|
-| 0/7 环境 | Python ≥ 3.9，依赖可导入 | 3.12.15；`auto → simd (prebuilt _simd.so)`；96 核 | PASS |
-| 1/7 完整性 | `RESULT : PASS`，无外部字典路径 | 35639 residues / 47.8 MB / licence present / external paths NONE | PASS |
-| 2/7 真实数据约束 | `RESULT : PASS`，计数非零 | 684 bonds / 915 angles / 117 planes / 242 torsions；f=7261.923272 | PASS |
-| 3/7 单元测试 | `OK`（17 项） | 7 s | PASS |
-| 4/7 数值自检 | `SELFTEST PASS`，10 项 | Fc vs gemmi 3.88e-08；X-ray FD 1.57e-08；几何 FD 3.29e-08；内核一致 fused 4e-16 / simd 1e-14 / fft 1.1e-03；64 s | PASS |
-| 5/7 短精修 | 打印 `RESULT`，R/Rfree 不升高 | R 0.3830→0.3825，Rfree 0.4116→0.4091，rmsBOND 0.0181→0.0091，7 s | PASS |
-| 6/7 产物校验 | `RESULT : PASS` | 15 列 MTZ、空间群/晶胞/反射数不变、无 NaN、R(MTZ)=0.3862 vs report 0.3825（差 0.0037，见 5.2） | PASS |
-| 7/7 内核一致（`--kernels`） | R/Rfree 差 < 1e-6 | numpy / fused / simd 全部 `R=0.382630 Rfree=0.409866`，最大差 2.5e-11 | PASS |
+| 0/7 Environment | Python ≥ 3.9 and importable dependencies | 3.12.15, `auto → simd (prebuilt _simd.so)`, 96 cores | PASS |
+| 1/7 Integrity | `RESULT : PASS` with no external dictionary paths | 35,639 residues, 47.8 MB, license present, no external paths | PASS |
+| 2/7 Real-data restraints | `RESULT : PASS` with nonzero counts | 684 bonds, 915 angles, 117 planes, 242 torsions, f=7261.923272 | PASS |
+| 3/7 Unit tests | `OK` (17 tests) | 7 s | PASS |
+| 4/7 Numerical self-test | `SELFTEST PASS` (10 checks) | Fc vs gemmi 3.88e-08, X-ray FD 1.57e-08, geometry FD 3.29e-08, kernel agreement fused 4e-16 / SIMD 1e-14, 61 s | PASS |
+| 5/7 Short refinement | Prints `RESULT` with no increase in R or Rfree | R 0.3830→0.3825, Rfree 0.4116→0.4091, rmsBOND 0.0181→0.0091, 7 s | PASS |
+| 6/7 Output checks | `RESULT : PASS` | 15 MTZ columns, unchanged space group, cell, and reflection count, no NaNs, R(MTZ)=0.3862 vs report 0.3825 (difference 0.0037, see Section 5.2) | PASS |
+| 7/7 Kernel agreement (`--kernels`) | R and Rfree differ by < 1e-6 | NumPy, fused, and SIMD all gave `R=0.382630 Rfree=0.409866`, maximum difference 2.5e-11 | PASS |
 
-总计 126 s（`--checks-only` 为 70 s）。逐阶段 PASS 与耗时另存
-`linux_test_out/summary.txt`，环境信息在 `env.txt`。
+Total runtime was 126 s, or 70 s with `--checks-only`. Stage results and timings are in
+`linux_test_out/summary.txt`. Environment details are in `env.txt`.
 
 ---
 
-## 4. 脚本之外的额外验证
+## 4. Additional validation
 
-### 4.1 多周期精修（5 cycle × 10 iter）
+### 4.1 Multi-cycle refinement (5 cycles × 10 iterations)
 
-修订后（`--kernel simd`，**39.4 s**；修订前 numpy 路径 215 s）：
+The revised SIMD run took **39.4 s**. The earlier NumPy run took 215 s.
 
 ```
 cycle 0  R=0.3830  Rfree=0.4116  FOM=0.682  rmsBOND=0.0181  w=2.59
@@ -112,36 +112,37 @@ cycle 4  R=0.3710  Rfree=0.4027  FOM=0.717  rmsBOND=0.0055  w=4.48
 cycle 5  R=0.3687  Rfree=0.4047  FOM=0.720  rmsBOND=0.0050  w=4.48
 ```
 
-**与第一轮 numpy 路径逐周期数值完全相同**（0.3687 / 0.4047），只是快了 5.5 倍
-——这正是「所有内核共用同一 G」的验证：换内核不换轨迹。
-Rfree 在第 3 周期见底后回升属方法学行为（5 周期已轻微过拟合），与平台无关。
+The SIMD run matched the original NumPy values cycle by cycle (final R 0.3687 and Rfree 0.4047)
+and ran 5.5× as fast. All kernels used the same coefficient G.
+Rfree reached its minimum in cycle 3 and rose afterward, suggesting mild overfitting by cycle 5 on both paths.
 
-### 4.2 真实规模数据（3056 原子 / 10607 反射 / 3.30 Å）
+### 4.2 Larger dataset (3,056 atoms, 10,607 reflections, 3.30 Å)
 
-`/raid0_ssd/AI-XRAY/output_hm/4L6R/4L6R_030075.{mtz,pdb}`：
+`/raid0_ssd/AI-XRAY/output_hm/4L6R/4L6R_030075.{mtz,pdb}`.
 
 ```
-列名自动识别（FOBS / SIGFOBS / R-free-flags）
-free set: R-free-flags=1 -> 531 of 10607 observed (5.0 %)   ← auto 判对了
-1 cycle × 3 iter：20.6 s（simd），R 0.2785→0.2702，Rfree 0.2781→0.2759
+Automatically detected columns (FOBS / SIGFOBS / R-free-flags)
+free set: R-free-flags=1 -> 531 of 10607 observed (5.0 %)
+1 cycle × 3 iterations in 20.6 s (SIMD), R 0.2785→0.2702, Rfree 0.2781→0.2759
 ```
 
-第一轮同一份数据需要人工加 `--free-value 1`（否则默认把 95% 数据当 free，
-得到无意义的 Rfree 0.3255）；现在 `auto` 直接判对，且启动日志把
-`free set: ... (5.0 %)` 打印出来。
+The original run required `--free-value 1`. The old default assigned 95% of reflections
+to the free set and gave an unusable Rfree of 0.3255. The revised `auto` detected the
+5.0% free set and reported it in the startup log.
 
-### 4.3 内核性能（7enm，1 cycle × 1 iter）
+### 4.3 Kernel performance (7enm, 1 cycle × 1 iteration)
 
-| 内核 | 时间 | 备注 |
+| Kernel | Time | Notes |
 |---|---|---|
-| numpy | 18.6 s | 参考实现 |
-| fused | 18.4 s | 无编译器时的选项 |
-| simd | 5.0 s | 3.7× 于 numpy；首次运行自动编译 `_simd.so` |
-| fft | 44 s | 网格按精度要求细化后，本机已无速度优势 |
+| numpy | 16.6 s | Reference implementation |
+| fused | 16.8 s | Available without a compiler |
+| simd | 4.8 s | 3.5× as fast as NumPy. Builds `_simd.so` on first use. |
 
-### 4.4 输出文件与 CCP4 生态的互操作
+> Version 0.3.0 removed the FFT path (`fftcalc.py`). See `CHANGELOG.md` for the earlier FFT changes.
 
-`mtzdump`（CCP4 9.0.017）读取 `refined.mtz` 正常：
+### 4.4 Output compatibility with CCP4 tools
+
+`mtzdump` from CCP4 9.0.017 read `refined.mtz` successfully.
 
 ```
 P 21 21 21, cell 35.245 40.703 66.328 90 90 90, 11057 reflections, 34.692–1.696 Å
@@ -150,73 +151,73 @@ HISTORY: MINIREFMAC version=0.2.0 kernel=simd / output_scale=absolute / F_abs = 
          free_column=FreeR_flag free_value=0 n_free=487 n_work=9713 / R_work R_free -LL
 ```
 
-`FWT/PHWT`、`DELFWT/PHDELWT` 命名符合 CCP4/COOT 习惯，可直接进 COOT 看 2Fo-Fc / Fo-Fc 图。
-`refined.pdb` 回读正常：670 原子 / 82 残基 / 2 链，B 5.4–74.7 Å²，无 NaN。
+`FWT/PHWT` and `DELFWT/PHDELWT` follow CCP4 and Coot conventions for 2Fo−Fc and Fo−Fc maps.
+`refined.pdb` reopened successfully with 670 atoms, 82 residues, 2 chains, B factors of 5.4–74.7 Å², and no NaNs.
 
-### 4.5 安装 / 入口 / 环境
+### 4.5 Installation and entry points
 
-- `pip install .`（干净 venv）成功，`minirefmac --version`、`minirefmac-selftest` 均可用
-- `python -m minirefmac` 与 `python -m minirefmac.cli` 等价
-- `run.sh` 现在优先用本地 `.venv/bin/python`，其次 `$PYTHON`，最后 `python3`
-- 从任意工作目录调用、`PYTHONPATH=/tmp` 干扰下均正常
-- `pack_release.sh` 产物：`oasis-refine-0.2.0.tar.gz`（46 MB，36 个文件），
-  解包后 `sha256sum -c MANIFEST.sha256` 全 OK，`import minirefmac` 正常
-- **全新解包复测**：把 tarball 解到空目录、用 uv 建全新 venv 装依赖
-  （包里没有 `.venv`、没有 `_simd.so`），`./run_linux_test.sh --checks-only`
-  → 5 阶段全 PASS（72 s），`_simd.so` 在解包目录内自动重编成功
-
----
-
-## 5. 两处曾经会误导使用者的问题（第二轮已修）
-
-### 5.1 free 标志约定：默认值会把 95% 的数据当 free（已修）
-
-旧行为默认 `--free-value 0`（CCP4 惯例 0 = free）。但 AI-XRAY 生成的 MTZ 里
-`R-free-flags` 是 **0 = work、1 = free**（10076 / 531）。默认跑不报错，只在日志里写成
-`work 531 / free 10076` —— 于是 Rfree 是在 95% 数据上算的，完全失去意义（0.3255 不能用）。
-
-现在的行为：`--free-value auto`（默认）按直方图判定，4L6R 自动得到
-`R-free-flags=1 -> 531 / 10607 (5.0 %)`；free 集 >30% 或落在 1–25% 之外会告警；
-没有 FreeR 列时明确写 `Rfree unavailable` 而不是把所有反射当 free。
-
-### 5.2 从输出 MTZ 直接复算 R，会比日志略高约 0.004（已写进文档与自检）
-
-日志 R = 0.3825 / Rfree 0.4091；直接拿输出 MTZ 的 `F` 和 `FC_ALL` 算得 0.3862 / 0.4106。
-不是错，是刻度约定：日志的 R 在观测刻度上算（`Σ|Fo − k·|Fc||/ΣFo`，逐反射 k 加权），
-输出文件是绝对刻度（`F_abs = F/k`、`FC_ALL` 也是绝对刻度）。用 `k·FC_ALL` 复算即得
-0.3825 / 0.4091，代数上完全一致——自检第 8 项就是在验证这一点，
-`check_outputs.py` 则用 0.01 的容差做产物层面的兜底。
+- `pip install .` succeeded in a clean virtual environment. `minirefmac --version` and `minirefmac-selftest` worked.
+- `python -m minirefmac` and `python -m minirefmac.cli` are equivalent.
+- At the time of the test, `run.sh` could use the local virtual environment, `$PYTHON`, or `python3`.
+- The launcher worked from other directories and with `PYTHONPATH=/tmp`.
+- `pack_release.sh` produced `oasis-refine-0.2.0.tar.gz` (46 MB, 36 files).
+  After extraction, `sha256sum -c MANIFEST.sha256` and `import minirefmac` succeeded.
+- A clean extraction with a fresh uv environment passed all five checks in
+  `./run_linux_test.sh --checks-only` in 72 s.
+  The SIMD kernel was rebuilt automatically in the extracted directory.
 
 ---
 
-## 6. 重新打包（第二轮已自动化）
+## 5. Correctness issues identified in validation
 
-1. 用 `./pack_release.sh`（内部 `tar` + 重生成 MANIFEST + 解包复验），**不要**用
-   Finder 压缩 / `zip -j`——第一轮就是被拍平的。
-2. 打包会自动排除 `.venv/`、`__pycache__/`、`*.so`（含 `_simd.so`，目标机自动重编）、
-   `linux_test_out/`、`dist/`、`.git/`。
-3. 打完包在 Mac 上跑一遍 `shasum -a 256 -c MANIFEST.sha256`，再传。
-4. 目标机：`tar xzf oasis-refine-0.2.0.tar.gz && cd oasis-refine-0.2.0` →
+### 5.1 FreeR flag selection
+
+The original default `--free-value 0` followed the CCP4 convention. The AI-XRAY MTZ used
+`0=work, 1=free` for 10,076 and 531 reflections respectively. The run continued with
+`work 531 / free 10076`, giving an unusable Rfree of 0.3255 on 95% of the reflections.
+
+The revised default `--free-value auto` examines the flag histogram. For 4L6R it reports
+`R-free-flags=1 -> 531 / 10607 (5.0 %)` and warns when selection falls outside the expected range.
+It reports `Rfree unavailable` when the data lack a FreeR column.
+
+### 5.2 MTZ and log R factors
+
+The log gives R/Rfree of 0.3825/0.4091. Direct calculation from the output `F` and `FC_ALL` gives 0.3862/0.4106.
+The log uses the observed scale, `Σ|Fo − k·|Fc||/ΣFo`, with a scale factor k for each reflection.
+The MTZ writes absolute-scale values, including `F_abs = F/k` and `FC_ALL`. Calculating on the observed scale
+reproduces 0.3825/0.4091. Numerical self-test 8 checks the algebra.
+`check_outputs.py` allows a difference of 0.01 when comparing output files and the report.
+
+---
+
+## 6. Repackaging the deployment
+
+1. Run `./pack_release.sh` to preserve paths, regenerate the checksum manifest, and verify archive extraction.
+   Preserve the full directory layout when transferring the delivery.
+2. The archive excludes `.venv/`, `__pycache__/`, and `*.so` (including `_simd.so`, rebuilt on the target),
+   `linux_test_out/`, `dist/`, `.git/`.
+3. Verify the manifest with `shasum -a 256 -c MANIFEST.sha256` on macOS before transfer.
+4. On the target host, extract the tarball and enter it with `tar xzf oasis-refine-0.2.0.tar.gz && cd oasis-refine-0.2.0`, then run
    `python3 -m venv .venv && .venv/bin/pip install -r requirements.txt` →
-   `./run_linux_test.sh`。
+   `./run_linux_test.sh`.
 
 ---
 
-## 7. 本机已验证清单
+## 7. Validation checklist
 
-- [x] 部署完整性（自包含字典，无外部 CIF / 无预编译二进制）
-- [x] 单体字典约束构建（684/915/117/242）
-- [x] 数值自检 10 项（Fc、-LL、X-ray 梯度 FD、几何梯度 FD、ML 参数、短精修、
-      输出 MTZ、绝对刻度、**内核一致**、**FreeR 约定**）
-- [x] 单元测试 17 项（free 标志 / FFT 网格 / 内核 / R 代数 / 列名识别 / 无 free 列）
-- [x] 短精修端到端（读 MTZ+PDB → 精修 → 写 PDB/MTZ/JSON）
-- [x] 5 周期精修（39.4 s，与 numpy 路径逐周期一致）
-- [x] 四内核（numpy / fused / simd / fft），三精确内核 R 差 2.5e-11
-- [x] `pip install .` + `minirefmac` / `minirefmac-selftest` 入口
-- [x] 产物校验（`check_outputs.py`）：MTZ 11 必需列、无 NaN、R 复算吻合、PDB 有限
-- [x] 输出 MTZ 被 CCP4 mtzdump 正常读取（15 列，P212121，1.70–34.69 Å）
-- [x] 输出 PDB 可回读（无 NaN，B 合理）
-- [x] 3056 原子真实数据规模（20.6 s / 周期，auto free 判定正确）
-- [x] 任意工作目录 / PYTHONPATH 干扰下运行
-- [x] `pack_release.sh` 打包 → 解包 → MANIFEST 校验 → import 全链路
-- [x] tarball 全新解包 + 全新 venv 复测（无预置 `.venv` / `_simd.so`）：5 阶段 PASS，72 s
+- [x] Deployment integrity with bundled dictionary and on-demand SIMD build
+- [x] Monomer restraint construction (684/915/117/242)
+- [x] Ten numerical checks (Fc, −LL, X-ray and geometry finite differences, ML parameters, short refinement,
+      MTZ columns, absolute scaling, kernel agreement, and FreeR conventions)
+- [x] Seventeen unit tests (FreeR flags, FFT grids, kernels, R algebra, MTZ column detection, and absent FreeR column)
+- [x] End-to-end short refinement from MTZ and PDB to PDB, MTZ, and JSON
+- [x] Five-cycle run (39.4 s, matching NumPy cycle by cycle)
+- [x] NumPy, fused, and SIMD agreement within 2.5e-11 for R (FFT removed in 0.3.0)
+- [x] `pip install .` and the `minirefmac` and `minirefmac-selftest` commands
+- [x] `check_outputs.py` verifies 11 required MTZ columns, finite values, and agreement when recalculating R
+- [x] Output MTZ readable by CCP4 mtzdump (15 columns, P 21 21 21, 1.70–34.69 Å)
+- [x] Output PDB readable with finite values and plausible B factors
+- [x] Larger 3,056-atom dataset (20.6 s per cycle, correct automatic FreeR selection)
+- [x] Launch from other working directories and with a custom PYTHONPATH
+- [x] Archive creation, extraction, manifest verification, and package import
+- [x] Fresh archive extraction and virtual environment with an on-demand SIMD build (five stages passed in 72 s)
