@@ -407,3 +407,11 @@ class TestColumnDetection(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+def test_invalid_b_factor_optimizer_scale_is_rejected():
+    from minirefmac.refine import Options, Refiner
+
+    for scale in (0, -1, float("inf"), float("nan")):
+        with unittest.TestCase().assertRaisesRegex(ValueError, "B-factor optimizer scale"):
+            Refiner(None, Options(b_scale=scale))

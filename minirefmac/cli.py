@@ -82,6 +82,8 @@ def build_parser():
     g.add_argument("--ncyc", type=int, default=5, help="outer cycles (REFMAC NCYC)")
     g.add_argument("--maxiter", type=int, default=10,
                    help="L-BFGS iterations per cycle")
+    g.add_argument("--b-scale", type=float, default=5.0, metavar="A2",
+                   help="B-factor optimizer scaling in square angstroms (default: 5)")
     g.add_argument("--bins", type=int, default=20,
                    help="resolution bins for the ML parameters D/S")
     g.add_argument("--solvent", choices=["mask", "babinet", "none"],
@@ -199,7 +201,7 @@ def main(argv=None):
     tag = (args.tag + "_") if args.tag else ""
 
     o = refine.Options(
-        ncyc=args.ncyc, maxiter=args.maxiter, n_bins=args.bins,
+        ncyc=args.ncyc, maxiter=args.maxiter, n_bins=args.bins, b_scale=args.b_scale,
         solvent=args.solvent, fit_aniso=not args.no_aniso,
         use_phase_prior=args.phase_prior,
         use_monlib=not args.no_monlib,

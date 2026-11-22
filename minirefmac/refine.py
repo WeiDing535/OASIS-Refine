@@ -113,6 +113,7 @@ class Options:
     out_mtz: str = None
     out_log: str = None
     out_json: str = None
+    b_scale: float = 5.0            # Å² per unit of the L-BFGS-B B variable
 
 
 class Refiner:
@@ -121,6 +122,8 @@ class Refiner:
     def __init__(self, data, opts=None):
         self.data = data
         self.opts = opts or Options()
+        if not math.isfinite(self.opts.b_scale) or self.opts.b_scale <= 0:
+            raise ValueError("B-factor optimizer scale must be positive and finite")
         self.kernel, self.kernel_reason = self._resolve_kernel()
         self.log_lines = []
         self.cycles = []
@@ -152,10 +155,10 @@ class Refiner:
         self._prev_fc_total = None
         self.w_balance = None
 
-        # parameter scaling: v = 1 corresponds to 0.1 A (xyz) / 5 A^2 (B)
+        # Parameter scaling uses ~0.1 A for coordinates and b_scale A^2 for B factors.
         a_mean = float(np.mean(data.cell_parameters[:3])) if data.cell_parameters else 50.0
         self.sx = 0.1 / max(a_mean, 1.0)
-        self.sb = 5.0
+        self.sb = self.opts.b_scale
 
     # ------------------------------------------------------------------
     def log(self, msg):

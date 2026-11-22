@@ -39,6 +39,16 @@ The run writes `out/refined.pdb`, `out/refined.mtz` on the absolute scale
 
 ---
 
+## B-factor optimizer scaling
+
+`--b-scale` sets the optimizer's B-factor coordinate scale in Å². The default
+is 5.0. Changing the scale changes the numerical trajectory within the
+L-BFGS iteration budget while keeping the same objective, B-factor bounds,
+and geometry weights. For the insulin SAD workflow, `--b-scale 2.5` gave
+better two-round results with the same 10 inner iterations per cycle.
+On the bundled 7ENM model the improvement was smaller. This setting is
+available for explicit trials at fixed cycle counts.
+
 ## Refinement engine
 
 | Component | Implementation |
