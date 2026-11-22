@@ -105,5 +105,6 @@ LINUX_TEST_REPORT.md    macOS-to-Linux validation report
 
 ## License
 
-The source code belongs to its author. The bundled `minirefmac/data/monlib_bundle.zip` derives from the CCP4 monomer dictionary and is redistributed under LGPL-3.0.
-See `minirefmac/data/LICENSE-CCP4-MONOMERS.txt` for the full license.
+OASIS-Refine source code is free for noncommercial academic research and teaching under the [Academic Use License](LICENSE). Commercial use requires a paid license. Contact dingwei@iphy.ac.cn for terms.
+
+The bundled CCP4 monomer dictionary remains under [LGPL-3.0](minirefmac/data/LICENSE-CCP4-MONOMERS.txt).

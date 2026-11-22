@@ -1,0 +1,40 @@
+OASIS-Refine Academic Use License
+
+Copyright (c) 2026 Wei Ding. All rights reserved.
+
+1. Free academic use
+
+Permission is granted, without a license fee, to individuals and institutions
+to run, copy and modify the covered software for noncommercial academic
+research or teaching. Copies and modifications may be shared within the
+academic project for those purposes, provided this notice is retained.
+Publication and reuse of scientific results do not require a software license
+fee. The software itself remains subject to this license.
+
+2. Commercial use and redistribution
+
+Commercial use requires a separate paid license agreed in writing before use.
+Commercial use includes use in commercial products or services, paid analysis
+for clients, or work carried out for a company's commercial research or
+product development. Contact dingwei@iphy.ac.cn for commercial licensing.
+Other use or redistribution of the covered software requires prior written
+permission, except where permitted by applicable law or the terms of the
+hosting platform.
+
+3. Scope
+
+This license covers the project code released under this notice for which
+Wei Ding holds the necessary rights. Third-party components, dependencies and
+data remain subject to their own notices. This license does not alter
+permissions already granted for copies under earlier licenses.
+
+The bundled CCP4 monomer dictionary remains under LGPL-3.0. See
+minirefmac/data/LICENSE-CCP4-MONOMERS.txt.
+
+4. Disclaimer
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+NONINFRINGEMENT. TO THE EXTENT PERMITTED BY LAW, THE COPYRIGHT HOLDER IS NOT
+LIABLE FOR CLAIMS, DAMAGES OR OTHER LIABILITY ARISING FROM THE SOFTWARE OR ITS
+USE.
